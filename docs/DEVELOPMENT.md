@@ -90,6 +90,11 @@ build\bin\BlueDroidEmulator.exe  # Windows
 - Runtime roots: Windows `%LOCALAPPDATA%\BlueDroid`; Linux
   `$XDG_DATA_HOME/BlueDroid` or `~/.local/share/BlueDroid`; macOS
   `~/Library/Application Support/BlueDroid`.
+- Pushing a `v*` tag runs `.github/workflows/release.yml` on GitHub-hosted
+  Windows x64/ARM64, Linux x64/ARM64, macOS Intel, and macOS Apple Silicon
+  runners. Each job packages a native asset and the final job attaches them,
+  plus `version.json`, to the GitHub release. Windows uses MSVC, Linux uses
+  AppImage, and macOS uses a dylibbundler-prepared app bundle inside a DMG.
 
 If linking fails with permission denied, stop the running process first:
 

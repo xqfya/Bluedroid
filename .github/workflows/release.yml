@@ -56,10 +56,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-22.04
+          - runner: ubuntu-24.04
             arch: x64
             appimage_arch: x86_64
-          - runner: ubuntu-22.04-arm
+          - runner: ubuntu-24.04-arm
             arch: arm64
             appimage_arch: aarch64
     steps:
@@ -93,7 +93,7 @@ jobs:
           cp packaging/bluedroid.svg AppDir/usr/share/icons/hicolor/256x256/apps/bluedroid.svg
           cp packaging/bluedroid.svg AppDir/usr/share/icons/hicolor/scalable/apps/bluedroid.svg
 
-          cat > AppDir/usr/share/applications/BlueDroid.desktop <<'DESKTOP'
+          cat > AppDir/BlueDroid.desktop <<'DESKTOP'
           [Desktop Entry]
           Type=Application
           Name=BlueDroid
@@ -102,6 +102,7 @@ jobs:
           Categories=Utility;
           Terminal=false
           DESKTOP
+          cp AppDir/BlueDroid.desktop AppDir/usr/share/applications/BlueDroid.desktop
 
           cat > AppDir/AppRun <<'APPRUN'
           #!/bin/sh
@@ -141,7 +142,7 @@ jobs:
         include:
           - runner: macos-15-intel
             arch: x64
-          - runner: macos-15
+          - runner: macos-latest
             arch: arm64
     steps:
       - uses: actions/checkout@v4

@@ -90,6 +90,24 @@ an `.exe` suffix.
 - Live FPS counter and periodic still card previews work on all platforms;
   `Ctrl+0` still resets the UI scale to 100% if it becomes unusable.
 
+### Downloads and updates
+
+Each GitHub release publishes a native package for the exact device architecture:
+
+| Device | Release asset |
+| --- | --- |
+| Windows x64 | `BlueDroid-vX.Y.Z-win-x64.zip` |
+| Windows ARM64 | `BlueDroid-vX.Y.Z-win-arm64.zip` |
+| Linux x64 | `BlueDroid-vX.Y.Z-linux-x64.AppImage` |
+| Linux ARM64 | `BlueDroid-vX.Y.Z-linux-arm64.AppImage` |
+| macOS Apple Silicon | `BlueDroid-vX.Y.Z-macos-arm64.dmg` |
+| macOS Intel | `BlueDroid-vX.Y.Z-macos-x64.dmg` |
+
+`version.json` is published alongside the packages. The auto-updater selects the
+asset whose name matches this OS and CPU before falling back to older release
+naming, so every device receives its own build. macOS DMGs are ad-hoc signed;
+if Gatekeeper blocks the first launch, right-click the app and choose **Open**.
+
 On first run BlueDroid creates its per-user data root and, if needed, downloads
 the Android SDK directly from Google's official XML manifests:
 

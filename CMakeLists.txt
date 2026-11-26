@@ -49,6 +49,14 @@ target_include_directories(BlueDroidEmulator PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/resources
 )
 
+# MSVC defines min/max macros through windows.h unless NOMINMAX is set before
+# the first include. They collide with std::min/std::max/std::clamp and with
+# chrono duration arithmetic, so disable them for every translation unit.
+target_compile_definitions(BlueDroidEmulator PRIVATE
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+)
+
 if(WIN32)
     # Windows libs (unchanged).
     target_link_libraries(BlueDroidEmulator PRIVATE
