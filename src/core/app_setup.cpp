@@ -47,13 +47,24 @@ void setEnv(const char* name, const fs::path& value) {
     emu::platform::setEnvironment(name, value.string());
 }
 
+// Native on x86 hosts and on macOS/Linux ARM hosts. Windows 11 ARM64 runs the
+// x64 emulator through its x64 emulation layer, so it stays on the x86_64 image.
+const char* preferredGuestAbi() {
+#ifdef _WIN32
+    (void)emu::platform::systemArchitecture();
+    return "x86_64";
+#else
+    return emu::platform::systemArchitecture() == "arm64" ? "arm64-v8a" : "x86_64";
+#endif
+}
+
 bool hasUsableSdk(const fs::path& sdk) {
     std::error_code ec;
     const std::string suffix = emu::platform::exeSuffix();
     return fs::is_regular_file(sdk / "platform-tools" / ("adb" + suffix), ec) &&
            fs::is_regular_file(sdk / "emulator" / ("emulator" + suffix), ec) &&
            fs::exists(sdk / "system-images" / "android-33" /
-                      "google_apis_playstore" / "x86_64" / "system.img", ec);
+                      "google_apis_playstore" / preferredGuestAbi() / "system.img", ec);
 }
 
 std::string lowerCopy(std::string s) {
@@ -197,6 +208,18 @@ const char* currentHostOs() {
 #endif
 }
 
+// Google publishes a native aarch64 emulator for macOS but not for Linux or
+// Windows. Those hosts keep the x64 SDK archive (x64 emulation handles Windows;
+// Linux falls back only when no native archive exists).
+const char* currentHostArchPreference() {
+#ifdef _WIN32
+    (void)emu::platform::systemArchitecture();
+    return "x64";
+#else
+    return emu::platform::systemArchitecture() == "arm64" ? "aarch64" : "x64";
+#endif
+}
+
 bool hostMatches(const std::string& archiveHost, const std::string& wantedHost) {
     if (wantedHost.empty()) return true; // system images are host-neutral
     const std::string host = lowerCopy(archiveHost);
@@ -209,7 +232,9 @@ bool hostMatches(const std::string& archiveHost, const std::string& wantedHost) 
     return true;
 }
 
-std::string archiveUrl(const std::string& packageBlock, const std::string& wantedHost) {
+std::string archiveUrl(const std::string& packageBlock, const std::string& wantedHost,
+                       const std::string& wantedArch) {
+    std::string fallback;
     size_t pos = 0;
     while ((pos = packageBlock.find("<archive", pos)) != std::string::npos) {
         size_t openEnd = packageBlock.find('>', pos);
@@ -222,20 +247,28 @@ std::string archiveUrl(const std::string& packageBlock, const std::string& wante
             continue;
         }
         const std::string url = tagValue(archive, "url");
-        // Keep the Windows behaviour byte-for-byte: only ZIP archives are
-        // installed by this bootstrap path.
-        if (!url.empty() && lowerCopy(url).find(".zip") != std::string::npos)
+        // Keep only ZIP archives; this bootstrap path never invokes Java or tar.
+        if (url.empty() || lowerCopy(url).find(".zip") == std::string::npos) {
+            pos = close;
+            continue;
+        }
+        const std::string archiveArch = lowerCopy(tagValue(archive, "host-arch"));
+        if (archiveArch.empty() || archiveArch == wantedArch ||
+            (wantedArch == "aarch64" && archiveArch == "arm64")) {
             return url;
+        }
+        if (fallback.empty()) fallback = url;
         pos = close;
     }
-    return std::string();
+    return fallback;
 }
 
 // Pick the newest non-obsolete archive for an exact package path. The system
 // image manifest contains several revisions of the same package, so comparing
 // revisions is safer than relying on document order.
 std::string latestPackageUrl(const std::string& xml, const std::string& path,
-                             const std::string& wantedHost) {
+                             const std::string& wantedHost,
+                             const std::string& wantedArch = std::string()) {
     std::string best;
     PackageVersion bestVersion;
     bool haveBest = false;
@@ -247,7 +280,7 @@ std::string latestPackageUrl(const std::string& xml, const std::string& path,
             lowerCopy(obsolete) == "true") {
             continue;
         }
-        const std::string url = archiveUrl(block, wantedHost);
+        const std::string url = archiveUrl(block, wantedHost, wantedArch);
         if (url.empty()) continue;
         const PackageVersion version = packageVersion(block);
         if (!haveBest || bestVersion < version) {
@@ -590,13 +623,16 @@ void AppSetup::installSdkAsync() {
         const fs::path temp = root / "temp";
         const fs::path sdk = root / "sdk";
 
+        // repository2-2.xml is the first repository manifest that publishes the
+        // native darwin_aarch64 emulator, needed for Apple Silicon hosts.
         const std::string repoManifest =
-            "https://dl.google.com/android/repository/repository2-1.xml";
+            "https://dl.google.com/android/repository/repository2-2.xml";
         const std::string sysImageManifest =
             "https://dl.google.com/android/repository/sys-img/"
             "google_apis_playstore/sys-img2-1.xml";
+        const std::string guestAbi = preferredGuestAbi();
         const std::string imagePackage =
-            "system-images;android-33;google_apis_playstore;x86_64";
+            std::string("system-images;android-33;google_apis_playstore;") + guestAbi;
 
 #ifdef _WIN32
         const fs::path platformZip = temp / "platform-tools-win.zip";
@@ -605,7 +641,8 @@ void AppSetup::installSdkAsync() {
         const fs::path platformZip = temp / "platform-tools.zip";
         const fs::path emulatorZip = temp / "emulator.zip";
 #endif
-        const fs::path systemImageZip = temp / "android-33-google-apis-playstore-x86_64.zip";
+        const fs::path systemImageZip =
+            temp / ("android-33-google-apis-playstore-" + guestAbi + ".zip");
         const std::string suffix = emu::platform::exeSuffix();
         const std::string adbMarker = "adb" + suffix;
         const std::string emulatorMarker = "emulator" + suffix;
@@ -690,10 +727,12 @@ void AppSetup::installSdkAsync() {
 
         const std::string platformPath =
             resolvePackageUrl(repoManifest,
-                latestPackageUrl(repositoryXml, "platform-tools", currentHostOs()));
+                latestPackageUrl(repositoryXml, "platform-tools", currentHostOs(),
+                                 currentHostArchPreference()));
         const std::string emulatorPath =
             resolvePackageUrl(repoManifest,
-                latestPackageUrl(repositoryXml, "emulator", currentHostOs()));
+                latestPackageUrl(repositoryXml, "emulator", currentHostOs(),
+                                 currentHostArchPreference()));
         const std::string systemImagePath =
             resolvePackageUrl(sysImageManifest,
                 latestPackageUrl(sysImageXml, imagePackage, ""));
@@ -727,7 +766,7 @@ void AppSetup::installSdkAsync() {
         if (!install("Android 13 system image", systemImageZip,
                      temp / "system-image-stage", "", "system.img",
                      sdk / "system-images" / "android-33" /
-                         "google_apis_playstore" / "x86_64", 95))
+                         "google_apis_playstore" / guestAbi, 95))
             return;
 
         if (!hasUsableSdk(sdk)) {

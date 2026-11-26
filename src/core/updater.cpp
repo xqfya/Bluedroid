@@ -1,6 +1,7 @@
 #include "emulator/updater.h"
 #include "emulator/app_setup.h"
 #include "emulator/http_client.h"
+#include "emulator/platform.h"
 
 #include <algorithm>
 #include <cctype>
@@ -25,7 +26,7 @@ constexpr char kPreferredAssetExtension[] = ".dmg";
 constexpr char kPreferredAssetExtension[] = ".AppImage";
 #endif
 constexpr char kApiHeaders[] =
-    "User-Agent: BlueDroid-Updater/1.0.1\r\n"
+    "User-Agent: BlueDroid-Updater/1.0.2\r\n"
     "Accept: application/vnd.github+json\r\n";
 
 bool skipWhitespace(const std::string& s, size_t& i) {
@@ -234,10 +235,30 @@ std::vector<Asset> parseAssets(const std::string& releaseJson) {
     return assets;
 }
 
+std::string releaseAssetToken() {
+    const bool arm64 = emu::platform::systemArchitecture() == "arm64";
+#if defined(_WIN32)
+    return arm64 ? "win-arm64" : "win-x64";
+#elif defined(__APPLE__)
+    return arm64 ? "macos-arm64" : "macos-x64";
+#else
+    return arm64 ? "linux-arm64" : "linux-x64";
+#endif
+}
+
 std::string chooseAssetUrl(const std::vector<Asset>& assets, std::string& error) {
     if (assets.empty()) {
         error = "release has no downloadable assets";
         return {};
+    }
+
+    // Preferred path: an asset explicitly named for this OS and CPU. Releases
+    // from before multi-arch packages fall through to the extension rules.
+    const std::string token = releaseAssetToken();
+    for (const Asset& asset : assets) {
+        const std::string name = lowerCopy(asset.name.empty() ? stripQuery(asset.url)
+                                                             : asset.name);
+        if (name.find(token) != std::string::npos) return asset.url;
     }
 
 #if defined(_WIN32)

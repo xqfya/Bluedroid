@@ -172,6 +172,17 @@ static const char* gpuModeName(int mode) {
     return mode == 1 ? "swiftshader" : "host";
 }
 
+// Windows ARM64 runs the x64 emulator through x64 emulation; macOS/Linux ARM64
+// use the native arm64-v8a Android image installed by the portable SDK setup.
+static const char* guestAbiName() {
+#ifdef _WIN32
+    (void)emu::platform::systemArchitecture();
+    return "x86_64";
+#else
+    return emu::platform::systemArchitecture() == "arm64" ? "arm64-v8a" : "x86_64";
+#endif
+}
+
 // Templates are stored with the phone profile and applied to the AVD config
 // before launch. Only values explicitly set by a template are written, so old
 // profiles keep using the global emulator.ini defaults.
@@ -272,7 +283,7 @@ static bool writeNativeAvd(const std::string& avdBase, const std::string& name,
     }
     cfg << "avd.ini.encoding=UTF-8\n"
         << "PlayStore.enabled=yes\n"
-        << "abi.type=x86_64\n"
+        << "abi.type=" << guestAbiName() << "\n"
         << "avd.id=<build>\n"
         << "avd.name=<build>\n"
         << "disk.cachePartition=yes\n"
@@ -285,7 +296,7 @@ static bool writeNativeAvd(const std::string& avdBase, const std::string& name,
         << "hw.battery=yes\n"
         << "hw.camera.back=emulated\n"
         << "hw.camera.front=none\n"
-        << "hw.cpu.arch=x86_64\n"
+        << "hw.cpu.arch=" << guestAbiName() << "\n"
         << "hw.cpu.ncore=" << cores << "\n"
         << "hw.dPad=no\n"
         << "hw.device.hash2=MD5:3274126e0242a0d86339850416b0ce34\n"
@@ -302,7 +313,7 @@ static bool writeNativeAvd(const std::string& avdBase, const std::string& name,
         << "hw.usb=yes\n"
         << "hw.wifi=yes\n"
         << "image.sysdir.1=system-images" << sep << "android-33" << sep
-        << "google_apis_playstore" << sep << "x86_64" << sep << "\n"
+        << "google_apis_playstore" << sep << guestAbiName() << sep << "\n"
         << "tag.display=Google Play\n"
         << "tag.id=google_apis_playstore\n"
         << "vm.heapSize=" << std::max(64, ram / 8) << "\n";

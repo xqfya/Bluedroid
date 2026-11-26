@@ -41,6 +41,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -697,6 +698,40 @@ const char* exeSuffix() {
     return ".exe";
 #else
     return "";
+#endif
+}
+
+std::string systemArchitecture() {
+#ifdef _WIN32
+    SYSTEM_INFO si{};
+    GetNativeSystemInfo(&si);
+    switch (si.wProcessorArchitecture) {
+        case PROCESSOR_ARCHITECTURE_ARM64: return "arm64";
+        case PROCESSOR_ARCHITECTURE_AMD64: return "x64";
+        case PROCESSOR_ARCHITECTURE_INTEL: return "x86";
+        case PROCESSOR_ARCHITECTURE_ARM: return "arm";
+        default: break;
+    }
+    const std::string wow = envA("PROCESSOR_ARCHITEW6432");
+    if (wow == "ARM64") return "arm64";
+    if (wow == "AMD64") return "x64";
+    const std::string native = envA("PROCESSOR_ARCHITECTURE");
+    if (native == "ARM64") return "arm64";
+    if (native == "AMD64") return "x64";
+    if (native == "x86") return "x86";
+    return "unknown";
+#else
+    utsname uts{};
+    if (uname(&uts) != 0) return "unknown";
+    const std::string machine = uts.machine;
+    if (machine == "x86_64" || machine == "amd64") return "x64";
+    if (machine == "aarch64" || machine == "arm64") return "arm64";
+    if (machine == "i386" || machine == "i486" || machine == "i586" ||
+        machine == "i686") {
+        return "x86";
+    }
+    if (machine.compare(0, 3, "arm") == 0) return "arm";
+    return machine.empty() ? "unknown" : machine;
 #endif
 }
 

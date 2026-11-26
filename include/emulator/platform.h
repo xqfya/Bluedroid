@@ -56,6 +56,8 @@ bool acquireSingleInstance();
 void releaseSingleInstance();
 
 const char* exeSuffix();
+// "x64", "arm64", "x86", or "unknown" for the native OS/CPU combination.
+std::string systemArchitecture();
 std::string dataRoot();
 std::string tempRoot();
 bool setEnvironment(const char* name, const std::string& value);
