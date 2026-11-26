@@ -110,13 +110,18 @@ static void keepEmulatorHidden(HWND hwnd, DWORD pid) {
     ex |= (LONG_PTR)WS_EX_TOOLWINDOW;
     SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex);
 
-    // Qt re-shows and re-centers its main window during boot, so re-apply the
-    // offscreen position repeatedly instead of only once at startup.
-    ShowWindow(hwnd, SW_HIDE);
-    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    // Move last: Qt re-centers the window while it is being shown.
-    SetWindowPos(hwnd, nullptr, -4000, -4000, 0, 0,
-                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    // Keep the capture surface visible but offscreen. Toggling SW_HIDE and
+    // SW_SHOWNOACTIVATE here made Qt repaint an all-white frame, which
+    // PrintWindow then caught once per rehide interval. Only restore the window
+    // if it was actually minimized/hidden; otherwise just move it back when Qt
+    // re-centers it.
+    if (IsIconic(hwnd) || !IsWindowVisible(hwnd))
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    RECT rc{};
+    if (!GetWindowRect(hwnd, &rc) || rc.right > -100 || rc.bottom > -100) {
+        SetWindowPos(hwnd, nullptr, -4000, -4000, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
 
     HideEmuCtx ctx{ hwnd, pid };
     EnumWindows(hideEmuWindowProc, reinterpret_cast<LPARAM>(&ctx));
@@ -1010,6 +1015,7 @@ void AndroidVirtualMachine::captureLoop() {
     auto lastHide = std::chrono::steady_clock::now();
     auto lastFind = std::chrono::steady_clock::now();
     int framesSinceLog = 0;
+    int whiteRun = 0;
 
     while (running_) {
         if (state_.load() != VmState::Running) {
@@ -1073,21 +1079,47 @@ void AndroidVirtualMachine::captureLoop() {
                         bi.bmiHeader.biSizeImage = (DWORD)bgra.size();
                         if (GetDIBits(memDC, hBmp, 0, capH, bgra.data(), &bi, DIB_RGB_COLORS)) {
                             const size_t pixels = (size_t)capW * capH;
-                            std::lock_guard<std::mutex> lk(fbMtx_);
-                            if (w_ != capW || h_ != capH) {
-                                w_ = capW; h_ = capH;
-                                fb_.assign((size_t)w_ * h_ * 4, 0);
-                                LOG_INFO("Screen size %dx%d", w_, h_);
+
+                            // Qt can repaint an all-white frame while the
+                            // offscreen surface is reconfigured. A short burst is
+                            // a capture artifact, so hold the previous Android
+                            // frame until the white actually persists.
+                            size_t sampled = 0;
+                            size_t white = 0;
+                            for (size_t p = 0; p < pixels; p += 16) {
+                                const size_t i = p * 4;
+                                ++sampled;
+                                if (bgra[i + 0] >= 250 && bgra[i + 1] >= 250 &&
+                                    bgra[i + 2] >= 250) {
+                                    ++white;
+                                }
                             }
-                            uint8_t* dst = fb_.data();
-                            for (size_t p = 0, i = 0; p < pixels; ++p, i += 4) {
-                                dst[i + 0] = bgra[i + 2];
-                                dst[i + 1] = bgra[i + 1];
-                                dst[i + 2] = bgra[i + 0];
-                                dst[i + 3] = 255;
+                            const bool nearlyWhite =
+                                sampled > 0 && white * 100 >= sampled * 98;
+                            const bool suppressWhite = nearlyWhite && whiteRun < 4;
+                            if (nearlyWhite) {
+                                if (whiteRun < 4) ++whiteRun;
+                            } else {
+                                whiteRun = 0;
                             }
-                            ++frames_;
-                            notifyFrame();
+
+                            if (!suppressWhite) {
+                                std::lock_guard<std::mutex> lk(fbMtx_);
+                                if (w_ != capW || h_ != capH) {
+                                    w_ = capW; h_ = capH;
+                                    fb_.assign((size_t)w_ * h_ * 4, 0);
+                                    LOG_INFO("Screen size %dx%d", w_, h_);
+                                }
+                                uint8_t* dst = fb_.data();
+                                for (size_t p = 0, i = 0; p < pixels; ++p, i += 4) {
+                                    dst[i + 0] = bgra[i + 2];
+                                    dst[i + 1] = bgra[i + 1];
+                                    dst[i + 2] = bgra[i + 0];
+                                    dst[i + 3] = 255;
+                                }
+                                ++frames_;
+                                notifyFrame();
+                            }
                             captured = true;
                         }
                     }
