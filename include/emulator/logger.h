@@ -15,6 +15,7 @@ public:
     static Logger& instance();
     void setLevel(LogLevel lvl);
     void setFile(const std::string& path);
+    void close();
     void log(LogLevel lvl, const std::string& msg);
 
     template <typename... Args>

@@ -2001,6 +2001,22 @@ void MainWindow::exitEverything() {
     DestroyWindow(hwnd_);
 }
 
+void MainWindow::uninstallEverything() {
+    LOG_INFO("Uninstall everything requested");
+    removeTrayIcon();
+    cancelAllApkJobs();
+    closeAllPhones();
+
+    // Delete the complete per-user tree before shutting down services that may
+    // still write to it. AppSetup closes the log and one-instance lock first.
+    AppSetup::uninstallAll();
+
+    NetworkStack::instance().shutdown();
+    AudioEngine::instance().shutdown();
+    emu::platform::releaseSingleInstance();
+    DestroyWindow(hwnd_);
+}
+
 void MainWindow::installTrayIcon() {
 #ifdef _WIN32
     if (trayIcon_) return;
@@ -3079,6 +3095,21 @@ void MainWindow::drawSettings() {
         ImGui::TextDisabled("Current version: %s", kAppVersion);
         if (ui::Button(updateCheckRunning_ ? "Checking..." : "Check for updates",
                        ImVec2(190, 34))) startUpdateCheck(true);
+        ui::EndCard();
+        y += 84;
+
+        ImGui::SetCursorScreenPos(ImVec2(px, y));
+        ui::BeginCard("UninstallEverything");
+        ImGui::TextColored(ui::TextMain, "Uninstall everything");
+        ImGui::TextWrapped("Permanently deletes all phones, SDK downloads, AVDs, settings, backups, APKs, and logs, then closes BlueDroid.");
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            ImGui::GetColorU32(ImVec4(0.62f, 0.16f, 0.16f, 1.0f)));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+            ImGui::GetColorU32(ImVec4(0.78f, 0.20f, 0.20f, 1.0f)));
+        const bool uninstallClicked = ui::Button("Uninstall everything", ImVec2(220, 34));
+        ImGui::PopStyleColor(2);
+        if (uninstallClicked) confirmUninstall_ = true;
         ui::EndCard();
 
     } else if (state_.settings.settingsTab == 1) {
@@ -4196,6 +4227,39 @@ void MainWindow::drawDialogs() {
                 ImGui::CloseCurrentPopup();
             }
         }
+            ImGui::EndPopup();
+        }
+    }
+
+    // Uninstall-everything confirmation.
+    if (confirmUninstall_ && !ImGui::IsPopupOpen("UninstallEverything"))
+        ImGui::OpenPopup("UninstallEverything");
+    {
+        PopupTheme theme(1.0f, true);
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_AlwaysAutoResize;
+        if (ImGui::BeginPopupModal("UninstallEverything", nullptr, flags)) {
+            ImGui::TextColored(ui::TextMain, "Uninstall everything?");
+            ImGui::TextWrapped("BlueDroid will close and permanently delete its entire data root: every phone, downloaded SDK package, AVD, setting, backup, APK, and log.");
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "This cannot be undone.");
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImGui::GetColorU32(ImVec4(0.62f, 0.16f, 0.16f, 1.0f)));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                ImGui::GetColorU32(ImVec4(0.78f, 0.20f, 0.20f, 1.0f)));
+            const bool confirmed = ui::Button("Delete everything and exit", ImVec2(220, 0));
+            ImGui::PopStyleColor(2);
+            if (confirmed) {
+                confirmUninstall_ = false;
+                uninstallEverything();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ui::Button("Cancel", ImVec2(110, 0))) {
+                confirmUninstall_ = false;
+                ImGui::CloseCurrentPopup();
+            }
             ImGui::EndPopup();
         }
     }

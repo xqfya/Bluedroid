@@ -21,6 +21,14 @@ void Logger::setFile(const std::string& path) {
     file_.open(path, std::ios::app);
 }
 
+void Logger::close() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (file_.is_open()) {
+        file_.flush();
+        file_.close();
+    }
+}
+
 const char* Logger::levelName(LogLevel l) const {
     switch (l) {
         case LogLevel::Trace: return "TRACE";

@@ -53,6 +53,10 @@ public:
     // Publishes a recoverable warning in the Manager banner. Empty clears it.
     static void setWarning(const std::string& text);
 
+    // Cancels any background SDK installer, closes the log file and deletes
+    // the complete per-user data root. Call only immediately before exit.
+    static bool uninstallAll();
+
     // Runs a process with no console/window flashes. timeoutMs == 0 waits
     // indefinitely. When capture is true, child stdout/stderr are collected
     // into output (if supplied).

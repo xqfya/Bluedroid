@@ -6,7 +6,7 @@
 namespace emu {
 
 // Version baked into this build. version.json on GitHub is compared against it.
-inline constexpr char kAppVersion[] = "1.0.2";
+inline constexpr char kAppVersion[] = "1.0.3";
 
 // GitHub endpoints used by the two-step updater.
 inline constexpr char kVersionUrl[] =

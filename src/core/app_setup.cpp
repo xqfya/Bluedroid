@@ -367,6 +367,7 @@ fs::path extractedSource(const fs::path& staging, const char* preferredName,
 std::atomic<bool> g_running{false};
 std::atomic<bool> g_done{false};
 std::atomic<bool> g_sdkReady{false};
+std::atomic<bool> g_cancelInstall{false};
 std::atomic<int> g_percent{0};
 std::mutex g_statusMutex;
 std::string g_stage;
@@ -519,6 +520,63 @@ void AppSetup::setWarning(const std::string& text) {
     publish(nullptr, g_percent.load());
 }
 
+bool AppSetup::uninstallAll() {
+    // Stop the detached installer before deleting the tree it writes into.
+    // Clearing the callback also prevents progress posts to a closing window.
+    g_cancelInstall.store(true);
+    setProgressCallback(nullptr);
+    for (int i = 0; i < 30 && g_running.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    g_running.store(false);
+    g_done.store(false);
+    g_sdkReady.store(false);
+    g_percent.store(0);
+    {
+        std::lock_guard<std::mutex> lock(g_statusMutex);
+        g_stage.clear();
+        g_error.clear();
+        g_warning.clear();
+    }
+
+    // A running ADB server keeps adb.exe (and its SDK folder) locked on
+    // Windows. Ask each known adb binary to shut its server down first.
+    const std::string adbName = "adb" + std::string(emu::platform::exeSuffix());
+    for (const fs::path adb : {
+             rootPath() / "sdk" / "platform-tools" / adbName,
+             fs::path(kSystemSdk) / "platform-tools" / adbName}) {
+        std::error_code adbEc;
+        if (!fs::is_regular_file(adb, adbEc)) continue;
+        const std::string command = "\"" + adb.string() + "\" kill-server";
+        std::string output;
+        int exitCode = 0;
+        emu::platform::runCommand(command, 5000, true, &output, &exitCode);
+        LOG_INFO("Stopped ADB server at %s (exit %d)", adb.string().c_str(), exitCode);
+    }
+
+    // The Windows log file and single-instance lock are held open; release
+    // both so remove_all() can delete their directories.
+    Logger::instance().close();
+    emu::platform::releaseSingleInstance();
+
+    bool ok = false;
+    const fs::path root = rootPath();
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        std::error_code ec;
+        fs::remove_all(root, ec);
+        if (!ec) {
+            ok = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // POSIX keeps the lock outside the data root; remove any stale file too.
+    std::error_code lockEc;
+    fs::remove(fs::path(emu::platform::tempRoot()) / "BlueDroid.lock", lockEc);
+    return ok;
+}
+
 void AppSetup::setProgressCallback(ProgressCallback cb) {
     std::lock_guard<std::mutex> lock(g_callbackMutex);
     g_callback = std::move(cb);
@@ -593,6 +651,7 @@ bool AppSetup::ensure() {
                     g_error.clear();
                 }
                 publish("Preparing SDK installer", 0);
+                g_cancelInstall.store(false);
                 std::thread(&AppSetup::installSdkAsync).detach();
             }
         } catch (...) {
@@ -607,7 +666,13 @@ void AppSetup::installSdkAsync() {
     g_done.store(false);
     g_percent.store(0);
 
+    const auto cancelled = []() { return g_cancelInstall.load(); };
     auto failed = [&](const std::string& why) {
+        if (cancelled()) {
+            g_running.store(false);
+            g_done.store(false);
+            return;
+        }
         LOG_ERROR("SDK setup failed: %s", why.c_str());
         {
             std::lock_guard<std::mutex> lock(g_statusMutex);
@@ -616,6 +681,12 @@ void AppSetup::installSdkAsync() {
         g_running.store(false);
         g_done.store(false);
         publish(nullptr, g_percent.load(), why.c_str());
+    };
+    auto stopIfCancelled = [&]() {
+        if (!cancelled()) return false;
+        g_running.store(false);
+        g_done.store(false);
+        return true;
     };
 
     try {
@@ -670,9 +741,11 @@ void AppSetup::installSdkAsync() {
                         lastPercent = percent;
                         publish(label, percent);
                     }
-                });
+                }, cancelled);
+            if (cancelled()) return false;
             if (!ok || !fs::exists(dest, ec) || fs::file_size(dest, ec) == 0) {
-                LOG_ERROR("Download failed: %s (%s)", label.c_str(), httpError.c_str());
+                if (!cancelled())
+                    LOG_ERROR("Download failed: %s (%s)", label.c_str(), httpError.c_str());
                 return false;
             }
             LOG_INFO("Downloaded %s (%llu bytes)", label.c_str(),
@@ -684,21 +757,25 @@ void AppSetup::installSdkAsync() {
                            const fs::path& staging, const char* preferredName,
                            const char* marker, const fs::path& dest,
                            int percent) -> bool {
+            if (stopIfCancelled()) return false;
             publish("Installing " + label, percent);
             if (!extractZip(zip, staging, label.c_str())) {
-                failed("Failed to extract " + label);
+                if (!cancelled()) failed("Failed to extract " + label);
                 return false;
             }
+            if (stopIfCancelled()) return false;
             const fs::path source = extractedSource(staging, preferredName, marker);
             if (source.empty()) {
                 LOG_ERROR("Archive for %s did not contain %s", label.c_str(), marker);
                 failed("Archive for " + label + " is missing " + marker);
                 return false;
             }
+            if (stopIfCancelled()) return false;
             if (!moveTree(source, dest)) {
-                failed("Failed to install " + label);
+                if (!cancelled()) failed("Failed to install " + label);
                 return false;
             }
+            if (stopIfCancelled()) return false;
             std::error_code ec;
             fs::remove(zip, ec);
             fs::remove_all(staging, ec);
@@ -713,15 +790,17 @@ void AppSetup::installSdkAsync() {
         std::string sysImageXml;
         std::string httpError;
         if (!emu::platform::httpGet(repoManifest, &repositoryXml, nullptr,
-                                    kSdkHeaders, httpError)) {
+                                    kSdkHeaders, httpError, platform::HttpProgress(), cancelled)) {
             failed("Failed to read the Android repository manifest: " + httpError);
             return;
         }
+        if (stopIfCancelled()) return;
         if (!emu::platform::httpGet(sysImageManifest, &sysImageXml, nullptr,
-                                    kSdkHeaders, httpError)) {
+                                    kSdkHeaders, httpError, platform::HttpProgress(), cancelled)) {
             failed("Failed to read the Android system image manifest: " + httpError);
             return;
         }
+        if (stopIfCancelled()) return;
         LOG_INFO("Repository manifest: %zu bytes; system image manifest: %zu bytes",
                  repositoryXml.size(), sysImageXml.size());
 
@@ -750,30 +829,37 @@ void AppSetup::installSdkAsync() {
         // 2. Download and extract each ZIP straight into its final SDK folder.
         if (!download("Downloading platform-tools", platformPath, platformZip, 6, 24))
             { failed("Failed to download platform-tools"); return; }
+        if (stopIfCancelled()) return;
         if (!install("platform-tools", platformZip, temp / "platform-tools-stage",
                      "platform-tools", adbMarker.c_str(), sdk / "platform-tools", 25))
             return;
+        if (stopIfCancelled()) return;
 
         if (!download("Downloading Android emulator", emulatorPath, emulatorZip, 29, 58))
             { failed("Failed to download the Android emulator"); return; }
+        if (stopIfCancelled()) return;
         if (!install("emulator", emulatorZip, temp / "emulator-stage",
                      "emulator", emulatorMarker.c_str(), sdk / "emulator", 59))
             return;
+        if (stopIfCancelled()) return;
 
         if (!download("Downloading Android 13 system image", systemImagePath,
                       systemImageZip, 63, 94))
             { failed("Failed to download the Android 13 system image"); return; }
+        if (stopIfCancelled()) return;
         if (!install("Android 13 system image", systemImageZip,
                      temp / "system-image-stage", "", "system.img",
                      sdk / "system-images" / "android-33" /
                          "google_apis_playstore" / guestAbi, 95))
             return;
+        if (stopIfCancelled()) return;
 
         if (!hasUsableSdk(sdk)) {
             failed("SDK installation finished but adb/emulator/system image is missing");
             return;
         }
 
+        if (stopIfCancelled()) return;
         g_sdkReady.store(true);
         g_percent.store(100);
         g_running.store(false);

@@ -31,6 +31,9 @@ DX11 HD post-processing shaders and per-user appearance settings.
 - Parking with Back keeps the phone running; Stop/Exit are explicit actions.
 - Tray behavior: window X hides BlueDroid by default; General settings can make
   it exit all instead.
+- Confirmed **Uninstall everything** action in General settings deletes the
+  complete per-user data root (phones, SDK, AVDs, settings, backups, APKs, logs)
+  and exits.
 - Anti-AFK sends only harmless DPAD keys; keep-awake sends only WAKEUP.
 
 ## Quick start
@@ -120,6 +123,10 @@ the Android SDK directly from Google's official XML manifests:
 On Windows it prefers an existing `C:\AndroidSDK`; otherwise it uses
 `<data root>\sdk`. On Linux and macOS the local SDK lives under `<data root>/sdk`.
 No JDK, `sdkmanager.bat`, or `avdmanager.bat` is required.
+
+**Uninstall everything** in General settings removes that whole data root after
+a confirmation prompt and closes BlueDroid. It does not delete the app package
+itself; remove the ZIP/AppImage/DMG from its install location separately.
 
 ## Default configuration
 

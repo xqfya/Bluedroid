@@ -146,6 +146,7 @@ private:
     void closeAllPhones();
     void detachAllPhones();
     void exitEverything();
+    void uninstallEverything();
     void installTrayIcon();
     void removeTrayIcon();
     void hideToTray();
@@ -245,6 +246,7 @@ private:
     char nameBuffer_[128] = {};
     bool confirmDelete_ = false;
     int deleteId_ = 0;
+    bool confirmUninstall_ = false;
     bool showMessageModal_ = false;
     std::string modalTitle_;
     std::string modalMessage_;

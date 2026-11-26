@@ -127,18 +127,22 @@ struct CurlContext {
     std::string* memory = nullptr;
     std::ofstream* file = nullptr;
     HttpProgress progress;
+    HttpCancel cancel;
     size_t done = 0;
     size_t lastReported = 0;
     bool writeFailed = false;
 
+    bool cancelled() const { return cancel && cancel(); }
+
     void report(size_t total) {
+        if (cancelled()) return;
         reportProgress(progress, lastReported, done, total);
     }
 };
 
 size_t writeCallback(char* data, size_t size, size_t count, void* userData) {
     auto* context = static_cast<CurlContext*>(userData);
-    if (!context) return 0;
+    if (!context || context->cancelled()) return 0;
     const size_t bytes = size * count;
     if (context->memory) context->memory->append(data, bytes);
     if (context->file) {
@@ -154,6 +158,7 @@ int progressCallback(void* userData, curl_off_t dltotal, curl_off_t dlnow,
                      curl_off_t, curl_off_t) {
     auto* context = static_cast<CurlContext*>(userData);
     if (!context) return 0;
+    if (context->cancelled()) return 1;
     context->report((size_t)dltotal);
     (void)dlnow;
     return 0;
@@ -163,6 +168,7 @@ int progressCallback(void* userData, double dltotal, double dlnow,
                      double, double) {
     auto* context = static_cast<CurlContext*>(userData);
     if (!context) return 0;
+    if (context->cancelled()) return 1;
     context->report((size_t)dltotal);
     (void)dlnow;
     return 0;
@@ -195,8 +201,14 @@ bool httpGet(const std::string& url,
              const std::string& headers,
              std::string& error,
              const HttpProgress& progress,
+             const HttpCancel& cancel,
              int maxRedirects) {
     error.clear();
+    const auto cancelled = [&]() { return cancel && cancel(); };
+    if (cancelled()) {
+        error = "cancelled by uninstall";
+        return false;
+    }
     if (!memory && !file) {
         error = "no output destination for HTTP GET";
         return false;
@@ -314,6 +326,11 @@ bool httpGet(const std::string& url,
             char chunk[64 * 1024];
             bool ok = true;
             for (;;) {
+                if (cancelled()) {
+                    error = "cancelled by uninstall";
+                    ok = false;
+                    break;
+                }
                 DWORD read = 0;
                 if (!WinHttpReadData(request, chunk, sizeof(chunk), &read)) {
                     error = winError("WinHttpReadData failed");
@@ -325,6 +342,11 @@ bool httpGet(const std::string& url,
                 if (memory) memory->append(chunk, read);
                 if (out) out.write(chunk, read);
                 reportProgress(progress, lastReported, done, total);
+                if (cancelled()) {
+                    error = "cancelled by uninstall";
+                    ok = false;
+                    break;
+                }
             }
             if (out && (!ok || !out)) {
                 if (error.empty()) error = "failed while writing download";
@@ -351,6 +373,7 @@ bool httpGet(const std::string& url,
         context.memory = memory;
         context.file = out ? &out : nullptr;
         context.progress = progress;
+        context.cancel = cancel;
 
         const std::string agent = userAgent(headers, "BlueDroid/1.0");
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
@@ -372,7 +395,7 @@ bool httpGet(const std::string& url,
         curl_easy_setopt(curl, CURLOPT_PROGRESSFUNCTION, &progressCallback);
         curl_easy_setopt(curl, CURLOPT_PROGRESSDATA, &context);
 #endif
-        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, progress ? 0L : 1L);
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, (progress || cancel) ? 0L : 1L);
 
         curl_slist* headerList = nullptr;
         for (const std::string& line : splitHeaders(headers))
@@ -386,6 +409,10 @@ bool httpGet(const std::string& url,
         if (headerList) curl_slist_free_all(headerList);
         curl_easy_cleanup(curl);
 
+        if (cancelled()) {
+            error = "cancelled by uninstall";
+            return false;
+        }
         if (result != CURLE_OK) {
             error = std::string("HTTP request failed: ") + curl_easy_strerror(result);
             return false;

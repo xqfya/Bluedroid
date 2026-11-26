@@ -90,6 +90,9 @@ build\bin\BlueDroidEmulator.exe  # Windows
 - Runtime roots: Windows `%LOCALAPPDATA%\BlueDroid`; Linux
   `$XDG_DATA_HOME/BlueDroid` or `~/.local/share/BlueDroid`; macOS
   `~/Library/Application Support/BlueDroid`.
+- The General settings **Uninstall everything** action cancels SDK setup,
+  closes the log and one-instance lock, and deletes the runtime root after a
+  confirmation prompt before exiting.
 - Pushing a `v*` tag runs `.github/workflows/release.yml` on GitHub-hosted
   Windows x64/ARM64, Linux x64/ARM64, macOS Intel, and macOS Apple Silicon
   runners. Each job packages a native asset and the final job attaches them,
