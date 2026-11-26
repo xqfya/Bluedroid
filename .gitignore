@@ -1,0 +1,15 @@
+# Build output and local runtime state
+/build/
+/target/
+/data/
+/thumbs/
+/emulator.ini
+/emulators.ini
+/emulator.log
+/screenshot.ppm
+/release/*.exe
+
+# Editor/IDE files
+/.vs/
+*.user
+*.suo

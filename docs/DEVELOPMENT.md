@@ -28,7 +28,7 @@ src/
     ppm_writer.c              still screenshot writer
 include/emulator/             public headers
 resources/ui.h                ImGui header/theme helper
-resources/imgui/              vendored Dear ImGui + DX11/Win32 backends
+resources/imgui/              Dear ImGui Git submodule + DX11/Win32 backends
 data/build.prop               sample only
 ```
 

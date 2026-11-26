@@ -33,6 +33,21 @@ optional HD post-processing shaders and per-user appearance settings.
 
 ## Quick start
 
+Dear ImGui is a Git submodule under `resources/imgui`. Clone with submodules:
+
+```sh
+git clone --recurse-submodules https://github.com/xqfya/Bluedroid.git
+cd Bluedroid
+```
+
+If you already cloned without them:
+
+```sh
+git submodule update --init --recursive
+```
+
+Then build:
+
 ```sh
 mkdir build && cd build
 cmake .. -G "MinGW Makefiles"
