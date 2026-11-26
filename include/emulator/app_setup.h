@@ -1,10 +1,5 @@
 #pragma once
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
 #include <functional>
 #include <string>
 
@@ -33,7 +28,8 @@ public:
     // no usable SDK is present. Safe to call more than once.
     static bool ensure();
 
-    // Per-user paths rooted at %LOCALAPPDATA%\BlueDroid.
+    // Per-user paths rooted at the platform data directory (LOCALAPPDATA on
+    // Windows, XDG data home on Linux, Application Support on macOS).
     static const std::string& root();
     static std::string configPath();
     static std::string profilesPath();
@@ -50,7 +46,7 @@ public:
     static std::string logPath();
     static std::string screenshotPath();
 
-    // True when a usable SDK exists (C:\AndroidSDK or the local SDK).
+    // True when a usable SDK exists (system SDK or the local SDK).
     static bool sdkReady();
     static SetupStatus status();
     static void setProgressCallback(ProgressCallback cb);
@@ -60,7 +56,7 @@ public:
     // Runs a process with no console/window flashes. timeoutMs == 0 waits
     // indefinitely. When capture is true, child stdout/stderr are collected
     // into output (if supplied).
-    static bool runHidden(const std::string& cmd, DWORD timeoutMs = 0,
+    static bool runHidden(const std::string& cmd, int timeoutMs = 0,
                           bool capture = false, std::string* output = nullptr);
 
 private:

@@ -8,12 +8,15 @@
 #include "emulator/network_stack.h"
 #include "emulator/audio_engine.h"
 #include "emulator/updater.h"
+#include "emulator/platform.h"
 
 #include "imgui.h"
 #include "imgui_internal.h"
+#include "ui.h"
+
+#ifdef _WIN32
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
-#include "ui.h"
 
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -22,6 +25,16 @@
 #include <psapi.h>
 #include <shellapi.h>
 #include <commdlg.h>
+#else
+#include "emulator/sdl_compat.h"
+#include "backends/imgui_impl_sdl2.h"
+#include "backends/imgui_impl_opengl3.h"
+#ifdef __APPLE__
+#include <OpenGL/gl.h>
+#else
+#include <GL/gl.h>
+#endif
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -37,6 +50,17 @@
 #include <system_error>
 #include <thread>
 
+#ifndef _WIN32
+// The SDL compatibility header intentionally mirrors only the API surface the
+// input manager needs; window.cpp still uses a couple of Win32 BOOL tokens.
+#ifndef TRUE
+#define TRUE 1
+#endif
+#ifndef FALSE
+#define FALSE 0
+#endif
+#endif
+
 #ifndef HIWORD
 #define HIWORD(x) ((WORD)((((DWORD_PTR)(x)) >> 16) & 0xFFFF))
 #endif
@@ -44,8 +68,16 @@
 #define LOWORD(x) ((WORD)((DWORD_PTR)(x) & 0xFFFF))
 #endif
 
+#ifdef _WIN32
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg,
                                                            WPARAM wParam, LPARAM lParam);
+#else
+// Extra Win32-shaped shims used by the shared UI code. sdl_compat.h deliberately
+// only exposes the subset needed by the input manager; these live in
+// sdl_compat.cpp so window.cpp keeps one shared implementation of the UI.
+extern LRESULT DefWindowProcW(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
+extern bool DestroyWindow(HWND hwnd);
+#endif
 
 namespace emu {
 
@@ -292,14 +324,19 @@ static std::string formatBytes(size_t bytes) {
     return buf;
 }
 
+#ifdef _WIN32
 static ULONGLONG fileTimeValue(const FILETIME& ft) {
     return ((ULONGLONG)ft.dwHighDateTime << 32) | (ULONGLONG)ft.dwLowDateTime;
 }
+#endif
 
 static void loadUiFonts(float sizePx, int family) {
     ImGuiIO& io = ImGui::GetIO();
     io.Fonts->Clear();
     namespace fs = std::filesystem;
+    ImFont* regularFont = nullptr;
+    g_fontBold = nullptr;
+#ifdef _WIN32
     struct FontPair { const wchar_t* regular; const wchar_t* bold; };
     const FontPair fonts[] = {
         { L"C:\\Windows\\Fonts\\calibri.ttf", L"C:\\Windows\\Fonts\\calibrib.ttf" },
@@ -308,8 +345,6 @@ static void loadUiFonts(float sizePx, int family) {
     family = (family == 1) ? 1 : 0;
     const int order[2] = { family, 1 - family };
 
-    ImFont* regularFont = nullptr;
-    g_fontBold = nullptr;
     for (int i : order) {
         const auto& f = fonts[i];
         std::error_code ec;
@@ -319,14 +354,33 @@ static void loadUiFonts(float sizePx, int family) {
             g_fontBold = io.Fonts->AddFontFromFileTTF(fs::path(f.bold).string().c_str(), sizePx);
         break;
     }
+#else
+    struct FontPair { const char* regular; const char* bold; };
+    const FontPair fonts[] = {
+        { "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+          "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" },
+        { "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+          "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" },
+        { "/Library/Fonts/Arial Unicode.ttf", "/Library/Fonts/Arial Bold.ttf" },
+    };
+    for (const auto& f : fonts) {
+        std::error_code ec;
+        if (!fs::exists(f.regular, ec)) continue;
+        regularFont = io.Fonts->AddFontFromFileTTF(f.regular, sizePx);
+        if (fs::exists(f.bold, ec))
+            g_fontBold = io.Fonts->AddFontFromFileTTF(f.bold, sizePx);
+        break;
+    }
+#endif
     if (!regularFont) io.Fonts->AddFontDefault();
     io.FontDefault = regularFont ? regularFont : io.Fonts->Fonts[0];
-    // This ImGui version uses dynamic font textures. The DX11 backend builds
-    // and uploads the atlas during NewFrame/Render; calling Build() here trips
-    // the RendererHasTextures assertion.
+    // This ImGui version uses dynamic font textures. Both backends build and
+    // upload the atlas during NewFrame/Render; calling Build() here trips the
+    // RendererHasTextures assertion.
 }
 
 struct MainWindow::Renderer {
+#ifdef _WIN32
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
     IDXGISwapChain* swapChain = nullptr;
@@ -344,17 +398,32 @@ struct MainWindow::Renderer {
     ID3D11PixelShader* postPS = nullptr;
     ID3D11Buffer* postConstants = nullptr;
     ID3D11SamplerState* postSampler = nullptr;
+#else
+    SDL_GLContext glContext = nullptr;
+    // Alias used by the shared releaseTexture(context) calls.
+    void* context = nullptr;
+#endif
     UINT sceneW = 0;
     UINT sceneH = 0;
+#ifdef _WIN32
     UINT sampleCount = 0;
+#endif
 };
 
 struct MainWindow::PhoneTexture {
+#ifdef _WIN32
     ID3D11Texture2D* texture = nullptr;
     ID3D11ShaderResourceView* srv = nullptr;
+#else
+    GLuint texture = 0;
+#endif
+    // ImGui 1.93 uses a 64-bit ImTextureID; keep the backend handle in a
+    // single shared field so the drawing code needs no platform branch.
+    ImTextureID view = 0;
     int w = 0, h = 0;
 };
 
+#ifdef _WIN32
 struct PostConstants {
     float sharpness;
     float contrast;
@@ -385,6 +454,48 @@ static std::string toUtf8(const std::wstring& w) {
     WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), n, nullptr, nullptr);
     return s;
 }
+#else
+// sdl_compat's drop shim hands us UTF-8 decoded into wchar_t code points.
+// A small round-trip is enough for file paths on POSIX.
+static std::wstring toWide(const std::string& s) {
+    std::wstring w;
+    w.reserve(s.size());
+    for (unsigned char c : s) w.push_back((wchar_t)c);
+    return w;
+}
+
+static std::string toUtf8(const std::wstring& w) {
+    std::string s;
+    s.reserve(w.size());
+    for (size_t i = 0; i < w.size(); ++i) {
+        unsigned int c = (unsigned int)w[i];
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < w.size() &&
+            w[i + 1] >= 0xDC00 && w[i + 1] <= 0xDFFF) {
+            c = 0x10000 + ((c - 0xD800) << 10) + ((unsigned int)w[++i] - 0xDC00);
+        }
+        if (c < 0x80) {
+            s.push_back((char)c);
+        } else if (c < 0x800) {
+            s.push_back((char)(0xC0 | (c >> 6)));
+            s.push_back((char)(0x80 | (c & 0x3F)));
+        } else if (c < 0x10000) {
+            if (c >= 0xD800 && c <= 0xDFFF) {
+                s.push_back('?'); // lone surrogate
+                continue;
+            }
+            s.push_back((char)(0xE0 | (c >> 12)));
+            s.push_back((char)(0x80 | ((c >> 6) & 0x3F)));
+            s.push_back((char)(0x80 | (c & 0x3F)));
+        } else {
+            s.push_back((char)(0xF0 | (c >> 18)));
+            s.push_back((char)(0x80 | ((c >> 12) & 0x3F)));
+            s.push_back((char)(0x80 | ((c >> 6) & 0x3F)));
+            s.push_back((char)(0x80 | (c & 0x3F)));
+        }
+    }
+    return s;
+}
+#endif
 
 // Keys that produce printable text. These are delivered by WM_CHAR only;
 // sending them as Android key events as well doubles characters and uses the
@@ -395,6 +506,9 @@ static bool isTextKey(int vk) {
     if (vk >= 'A' && vk <= 'Z') return true;
     if (vk >= VK_OEM_1 && vk <= VK_OEM_3) return true;
     if (vk >= VK_OEM_4 && vk <= VK_OEM_7) return true;
+    // On POSIX sdl_compat.h exposes VK_OEM_7 as 0xDD (']'), while apostrophe
+    // is the undocumented 0xDE. It still arrives as WM_CHAR text input.
+    if (vk == 0xDE) return true;
     if (vk == VK_OEM_102) return true;
     if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) return true;
     if (vk == VK_MULTIPLY || vk == VK_ADD || vk == VK_SEPARATOR ||
@@ -479,7 +593,20 @@ MainWindow::MainWindow() {
 
 MainWindow::~MainWindow() {
     cancelAllApkJobs();
+#ifndef _WIN32
+    // Capture these before shutdownRenderer() clears renderer_->glContext.
+    SDL_Window* sdlWindow = (SDL_Window*)hwnd_;
+    SDL_GLContext glContext = renderer_ ? renderer_->glContext : nullptr;
+    if (!glContext && sdlWindow) glContext = SDL_GL_GetCurrentContext();
+#endif
     shutdownRenderer();
+#ifndef _WIN32
+    if (glContext) SDL_GL_DeleteContext(glContext);
+    if (sdlWindow) SDL_DestroyWindow(sdlWindow);
+    emu::sdlcompat::setWindow(nullptr);
+    emu::sdlcompat::setMainWindow(nullptr);
+    SDL_Quit();
+#endif
 }
 
 bool MainWindow::initRenderer() {
@@ -492,11 +619,12 @@ bool MainWindow::initRenderer() {
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
 
-    // Real Windows UI font (Calibri, with Segoe UI fallback), sized from the
-    // saved appearance settings rather than ImGui's tiny bitmap default.
+    // Real UI font sized from the saved appearance settings rather than ImGui's
+    // tiny bitmap default (Calibri/Segoe on Windows, DejaVu elsewhere).
     loadUiFonts((float)state_.settings.fontSize, state_.settings.fontFamily);
     applyThemeFromSettings();
 
+#ifdef _WIN32
     if (!ImGui_ImplWin32_Init(hwnd_)) {
         LOG_ERROR("ImGui Win32 backend failed");
         shutdownRenderer();
@@ -553,10 +681,41 @@ bool MainWindow::initRenderer() {
     }
     if (!createPostShaders())
         LOG_ERROR("HD shaders unavailable; falling back to standard rendering");
+#else
+    if (!ImGui_ImplWin32_Init(hwnd_)) {
+        LOG_ERROR("ImGui SDL2 backend failed");
+        shutdownRenderer();
+        return false;
+    }
+    renderer_->glContext = SDL_GL_GetCurrentContext();
+    if (!renderer_->glContext) {
+        LOG_ERROR("SDL OpenGL context is missing");
+        shutdownRenderer();
+        return false;
+    }
+    renderer_->context = renderer_->glContext;
+    if (!ImGui_ImplDX11_Init(nullptr, nullptr)) {
+        LOG_ERROR("ImGui OpenGL3 backend failed");
+        shutdownRenderer();
+        return false;
+    }
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    createPostShaders(); // SDL path logs once that HD post effects are unavailable
+#endif
     return true;
 }
 
 bool MainWindow::createPostShaders() {
+#ifndef _WIN32
+    // HD post-processing is a DX11-only feature. Keep the setting plumbed
+    // through the shared UI but do not build a second GL effect pipeline.
+    static bool logged = false;
+    if (!logged) {
+        LOG_INFO("HD post-processing is unavailable with the SDL/OpenGL backend");
+        logged = true;
+    }
+    return false;
+#else
     if (!renderer_ || !renderer_->device) return false;
 
     static const char kPostVs[] = R"hd(
@@ -689,20 +848,27 @@ float4 main(VS_OUT input) : SV_TARGET {
         return false;
     }
     return true;
+#endif
 }
 
 void MainWindow::releasePostTargets() {
     if (!renderer_) return;
+#ifdef _WIN32
     releaseCom(renderer_->sceneRtv);
     releaseCom(renderer_->sceneSrv);
     releaseCom(renderer_->sceneTex);
     releaseCom(renderer_->msaaRtv);
     releaseCom(renderer_->msaaTex);
-    renderer_->sceneW = renderer_->sceneH = 0;
     renderer_->sampleCount = 0;
+#endif
+    renderer_->sceneW = renderer_->sceneH = 0;
 }
 
 bool MainWindow::ensurePostTargets(UINT width, UINT height) {
+#ifndef _WIN32
+    (void)width; (void)height;
+    return false;
+#else
     if (!renderer_ || !renderer_->device || width == 0 || height == 0) return false;
     if (state_.settings.shaderMode <= 0) {
         releasePostTargets();
@@ -769,9 +935,14 @@ bool MainWindow::ensurePostTargets(UINT width, UINT height) {
     renderer_->sampleCount = samples;
     updatePostConstants(width, height);
     return true;
+#endif
 }
 
 void MainWindow::updatePostConstants(UINT width, UINT height) {
+#ifndef _WIN32
+    (void)width; (void)height;
+    return;
+#else
     if (!renderer_ || !renderer_->context || !renderer_->postConstants) return;
     PostConstants pc{};
     pc.sharpness = (float)state_.settings.sharpness / 100.0f * 0.55f;
@@ -787,9 +958,13 @@ void MainWindow::updatePostConstants(UINT width, UINT height) {
             D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return;
     memcpy(mapped.pData, &pc, sizeof(pc));
     renderer_->context->Unmap(renderer_->postConstants, 0);
+#endif
 }
 
 void MainWindow::renderPostPass() {
+#ifndef _WIN32
+    return;
+#else
     auto* r = renderer_.get();
     if (!r || !r->context || !r->rtv || !r->sceneSrv || !r->postVS ||
         !r->postPS || !r->postConstants || !r->postSampler) return;
@@ -829,15 +1004,30 @@ void MainWindow::renderPostPass() {
 
     ID3D11ShaderResourceView* noSrv = nullptr;
     ctx->PSSetShaderResources(0, 1, &noSrv);
+#endif
 }
 
+#ifdef _WIN32
 void MainWindow::releaseTexture(PhoneTexture* tex, ID3D11DeviceContext* ctx) {
     if (!tex) return;
     (void)ctx;
     if (tex->srv) { tex->srv->Release(); tex->srv = nullptr; }
     if (tex->texture) { tex->texture->Release(); tex->texture = nullptr; }
+    tex->view = 0;
     tex->w = tex->h = 0;
 }
+#else
+void MainWindow::releaseTexture(PhoneTexture* tex, void* ctx) {
+    if (!tex) return;
+    (void)ctx;
+    if (tex->texture) {
+        glDeleteTextures(1, &tex->texture);
+        tex->texture = 0;
+    }
+    tex->view = 0;
+    tex->w = tex->h = 0;
+}
+#endif
 
 void MainWindow::shutdownRenderer() {
     for (auto& kv : textures_) releaseTexture(kv.second.get(), renderer_ ? renderer_->context : nullptr);
@@ -845,39 +1035,66 @@ void MainWindow::shutdownRenderer() {
     if (!renderer_) return;
 
     releasePostTargets();
+#ifdef _WIN32
     releaseCom(renderer_->postVS);
     releaseCom(renderer_->postPS);
     releaseCom(renderer_->postConstants);
     releaseCom(renderer_->postSampler);
+#endif
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     g_fontBold = nullptr;
 
+#ifdef _WIN32
     if (renderer_->rtv) { renderer_->rtv->Release(); renderer_->rtv = nullptr; }
     if (renderer_->swapChain) { renderer_->swapChain->Release(); renderer_->swapChain = nullptr; }
     if (renderer_->context) { renderer_->context->Release(); renderer_->context = nullptr; }
     if (renderer_->device) { renderer_->device->Release(); renderer_->device = nullptr; }
+#else
+    // The SDL window/GL context outlives the ImGui context; it is released when
+    // the SDL event loop exits so WM_DESTROY-style teardown stays order-safe.
+    renderer_->glContext = nullptr;
+    renderer_->context = nullptr;
+#endif
     renderer_.reset();
 }
 
 void MainWindow::resizeRenderer() {
+#ifdef _WIN32
     if (!renderer_ || !renderer_->swapChain || !renderer_->device || !renderer_->context) return;
+#else
+    if (!renderer_) return;
+#endif
     RECT rc{};
     GetClientRect(hwnd_, &rc);
     UINT w = (UINT)std::max(1, (int)rc.right);
     UINT h = (UINT)std::max(1, (int)rc.bottom);
+#ifdef _WIN32
     if (renderer_->rtv) { renderer_->rtv->Release(); renderer_->rtv = nullptr; }
     if (FAILED(renderer_->swapChain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0))) return;
     ID3D11Texture2D* back = nullptr;
     if (FAILED(renderer_->swapChain->GetBuffer(0, IID_PPV_ARGS(&back)))) return;
     renderer_->device->CreateRenderTargetView(back, nullptr, &renderer_->rtv);
     back->Release();
+#else
+    // SDL keeps the GL drawable in sync with the window; only the cached size
+    // used for post targets needs refreshing.
+    renderer_->sceneW = w;
+    renderer_->sceneH = h;
+#endif
 }
 
 bool MainWindow::create(HINSTANCE hInst, int nCmdShow) {
     hInst_ = hInst;
+#ifndef _WIN32
+    // SDL's quit state and custom-event queue live in the compat layer, not in
+    // this instance. Clear both so a recreated manager starts from a clean slate.
+    emu::sdlcompat::setQuitRequested(false);
+    MSG pending{};
+    while (emu::sdlcompat::nextCustomMessage(pending)) {}
+#endif
     createdAt_ = std::chrono::steady_clock::now();
     lastFpsSample_ = createdAt_;
     lastInputAt_ = createdAt_;
@@ -890,6 +1107,10 @@ bool MainWindow::create(HINSTANCE hInst, int nCmdShow) {
     lastResourceSample_ = createdAt_;
     loadPreviews();
 
+    std::string title = ConfigManager::instance().config().instanceName + " Manager";
+    winW_ = 1280;
+    winH_ = 800;
+#ifdef _WIN32
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
@@ -904,10 +1125,7 @@ bool MainWindow::create(HINSTANCE hInst, int nCmdShow) {
         return false;
     }
 
-    std::string title = ConfigManager::instance().config().instanceName + " Manager";
     std::wstring wtitle(title.begin(), title.end());
-    winW_ = 1280;
-    winH_ = 800;
     hwnd_ = CreateWindowExW(WS_EX_APPWINDOW, CLASS_NAME, wtitle.c_str(), kWindowStyle,
         CW_USEDEFAULT, CW_USEDEFAULT, winW_, winH_, nullptr, nullptr, hInst, this);
     if (!hwnd_) { LOG_ERROR("CreateWindowEx failed"); return false; }
@@ -917,9 +1135,71 @@ bool MainWindow::create(HINSTANCE hInst, int nCmdShow) {
     SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     applyWindowCorners();
+#else
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_EVENTS) != 0) {
+        LOG_ERROR("SDL_Init failed: %s", SDL_GetError());
+        return false;
+    }
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+#ifdef __APPLE__
+    // macOS only exposes modern GL through a core profile. ImGui selects
+    // #version 150 there, so request a context that supports it.
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+#else
+    // A 3.0 compatibility context is universally available on desktop Linux
+    // and accepts the backend's default #version 130 shaders.
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+#endif
+    hwnd_ = (HWND)SDL_CreateWindow(title.c_str(), SDL_WINDOWPOS_CENTERED,
+        SDL_WINDOWPOS_CENTERED, winW_, winH_,
+        SDL_WINDOW_BORDERLESS | SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL |
+        SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI);
+    if (!hwnd_) {
+        LOG_ERROR("SDL_CreateWindow failed: %s", SDL_GetError());
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "BlueDroid",
+            "Could not create the BlueDroid window.", nullptr);
+        SDL_Quit();
+        return false;
+    }
+    SDL_StartTextInput();
+    SDL_GLContext gl = SDL_GL_CreateContext((SDL_Window*)hwnd_);
+    if (!gl) {
+        LOG_ERROR("SDL_GL_CreateContext failed: %s", SDL_GetError());
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "BlueDroid",
+            "OpenGL is required to run BlueDroid.", (SDL_Window*)hwnd_);
+        SDL_DestroyWindow((SDL_Window*)hwnd_);
+        hwnd_ = nullptr;
+        SDL_Quit();
+        return false;
+    }
+    SDL_GL_MakeCurrent((SDL_Window*)hwnd_, gl);
+    SDL_GL_SetSwapInterval(1); // match DX11's Present(1, 0)
+    emu::sdlcompat::setWindow((SDL_Window*)hwnd_);
+    emu::sdlcompat::setMainWindow(this);
+
+    // The custom ImGui cursor replaces the native one.
+    static const Uint8 emptyBits[1] = { 0 };
+    static const Uint8 emptyMask[1] = { 0 };
+    static SDL_Cursor* emptyCursor = nullptr;
+    if (!emptyCursor) emptyCursor = SDL_CreateCursor(emptyBits, emptyMask, 1, 1, 0, 0);
+    if (emptyCursor) SDL_SetCursor(emptyCursor);
+
+    applyWindowCorners();
+#endif
 
     if (!initRenderer()) {
+#ifdef _WIN32
         MessageBoxW(nullptr, L"DirectX 11 is required to run BlueDroid.", L"BlueDroid", MB_OK | MB_ICONERROR);
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "BlueDroid",
+            "OpenGL is required to run BlueDroid.", (SDL_Window*)hwnd_);
+#endif
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
         return false;
@@ -998,6 +1278,7 @@ void MainWindow::debugInstallTestApk(const std::string& path) {
 }
 
 void MainWindow::runMessageLoop() {
+#ifdef _WIN32
     MSG msg{};
     for (;;) {
         if (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -1007,8 +1288,155 @@ void MainWindow::runMessageLoop() {
         }
         renderFrame();
     }
+#else
+    auto makePoint = [](int x, int y) -> LPARAM {
+        return (LPARAM)(((DWORD)(x)&0xFFFF) | (((DWORD)(y)&0xFFFF) << 16));
+    };
+    bool quit = false;
+    bool resizingWindow = false;
+    LRESULT resizeHit = HTCLIENT;
+    POINT resizeCursorOrigin{};
+    RECT resizeWindowOrigin{};
+    SDL_Event event{};
+    MSG msg{};
+    for (;;) {
+        while (SDL_PollEvent(&event)) {
+            emu::sdlcompat::processEvent(event);
+            switch (event.type) {
+                case SDL_QUIT:
+                    // A quit already in flight came from exitEverything();
+                    // don't run WM_CLOSE a second time for the same shutdown.
+                    if (emu::sdlcompat::quitRequested()) {
+                        quit = true;
+                        break;
+                    }
+                    // Route the window-manager close through the same WM_CLOSE
+                    // flow as Windows so "minimize to tray" is still honored.
+                    handle(hwnd_, WM_CLOSE, 0, 0);
+                    if (emu::sdlcompat::quitRequested()) quit = true;
+                    break;
+                case SDL_WINDOWEVENT:
+                    if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+                        event.window.event == SDL_WINDOWEVENT_RESIZED) {
+                        handle(hwnd_, WM_SIZE, (WPARAM)event.window.data1,
+                               makePoint((int)event.window.data1, (int)event.window.data2));
+                    } else if (event.window.event == SDL_WINDOWEVENT_CLOSE &&
+                               !emu::sdlcompat::quitRequested()) {
+                        handle(hwnd_, WM_CLOSE, 0, 0);
+                    }
+                    break;
+                case SDL_DROPFILE:
+                    // DragFinish() in handle() frees event.drop.file via SDL_free.
+                    handle(hwnd_, WM_DROPFILES, (WPARAM)event.drop.file, 0);
+                    break;
+                case SDL_KEYDOWN:
+                    handle(hwnd_, WM_KEYDOWN, (WPARAM)emu::sdlcompat::keyToVk(event.key.keysym.sym), 0);
+                    break;
+                case SDL_KEYUP:
+                    handle(hwnd_, WM_KEYUP, (WPARAM)emu::sdlcompat::keyToVk(event.key.keysym.sym), 0);
+                    break;
+                case SDL_TEXTINPUT: {
+                    for (const unsigned char* p = (const unsigned char*)event.text.text; *p; ++p)
+                        handle(hwnd_, WM_CHAR, (WPARAM)*p, 0);
+                    break;
+                }
+                case SDL_MOUSEMOTION:
+                    if (resizingWindow) {
+                        // SDL has no DefWindowProc to act on WM_NCHITTEST, so
+                        // apply the shared hit result ourselves.
+                        POINT pt{};
+                        GetCursorPos(&pt);
+                        const int dx = pt.x - resizeCursorOrigin.x;
+                        const int dy = pt.y - resizeCursorOrigin.y;
+                        int x = resizeWindowOrigin.left;
+                        int y = resizeWindowOrigin.top;
+                        int w = resizeWindowOrigin.right - resizeWindowOrigin.left;
+                        int h = resizeWindowOrigin.bottom - resizeWindowOrigin.top;
+                        constexpr int minW = 480, minH = 360;
+                        switch (resizeHit) {
+                            case HTLEFT:       x += dx; w -= dx; break;
+                            case HTRIGHT:      w += dx; break;
+                            case HTTOP:        y += dy; h -= dy; break;
+                            case HTBOTTOM:     h += dy; break;
+                            case HTTOPLEFT:    x += dx; y += dy; w -= dx; h -= dy; break;
+                            case HTTOPRIGHT:   y += dy; w += dx; h -= dy; break;
+                            case HTBOTTOMLEFT: x += dx; w -= dx; h += dy; break;
+                            case HTBOTTOMRIGHT:w += dx; h += dy; break;
+                            default: break;
+                        }
+                        if (w < minW) { if (resizeHit == HTLEFT || resizeHit == HTTOPLEFT ||
+                                            resizeHit == HTBOTTOMLEFT) x -= minW - w;
+                                        w = minW; }
+                        if (h < minH) { if (resizeHit == HTTOP || resizeHit == HTTOPLEFT ||
+                                            resizeHit == HTTOPRIGHT) y -= minH - h;
+                                        h = minH; }
+                        SDL_SetWindowPosition((SDL_Window*)hwnd_, x, y);
+                        SDL_SetWindowSize((SDL_Window*)hwnd_, w, h);
+                    } else {
+                        handle(hwnd_, WM_MOUSEMOVE, 1, makePoint(event.motion.x, event.motion.y));
+                    }
+                    break;
+                case SDL_MOUSEBUTTONDOWN:
+                    if (event.button.button == SDL_BUTTON_LEFT) {
+                        // WM_NCHITTEST expects screen coordinates. SDL only
+                        // gives us client coords, so ask SDL for the global one.
+                        POINT cursor{};
+                        GetCursorPos(&cursor);
+                        const LRESULT hit = handle(hwnd_, WM_NCHITTEST, 0,
+                            makePoint(cursor.x, cursor.y));
+                        if (hit == HTCAPTION) {
+                            RECT window{};
+                            if (GetWindowRect(hwnd_, &window)) {
+                                dragCursorOrigin_ = cursor;
+                                dragWindowOrigin_ = { window.left, window.top };
+                                draggingWindow_ = true;
+                                SetCapture(hwnd_);
+                                break;
+                            }
+                        } else if (hit != HTCLIENT) {
+                            RECT window{};
+                            if (GetWindowRect(hwnd_, &window)) {
+                                resizeCursorOrigin = cursor;
+                                resizeWindowOrigin = window;
+                                resizeHit = hit;
+                                resizingWindow = true;
+                                SetCapture(hwnd_);
+                                break;
+                            }
+                        }
+                        handle(hwnd_, WM_LBUTTONDOWN, 1,
+                               makePoint(event.button.x, event.button.y));
+                    }
+                    break;
+                case SDL_MOUSEBUTTONUP:
+                    if (event.button.button == SDL_BUTTON_LEFT) {
+                        if (resizingWindow) {
+                            resizingWindow = false;
+                            ReleaseCapture();
+                            break;
+                        }
+                        if (draggingWindow_) {
+                            draggingWindow_ = false;
+                            ReleaseCapture();
+                        }
+                        handle(hwnd_, WM_LBUTTONUP, 1,
+                               makePoint(event.button.x, event.button.y));
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+        while (emu::sdlcompat::nextCustomMessage(msg)) {
+            handle(msg.hwnd ? msg.hwnd : hwnd_, msg.message, msg.wParam, msg.lParam);
+        }
+        if (quit || emu::sdlcompat::quitRequested()) break;
+        renderFrame();
+    }
+#endif
 }
 
+#ifdef _WIN32
 LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     MainWindow* self = (MainWindow*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if (self && self->renderer_) {
@@ -1021,6 +1449,13 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
+#else
+LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    MainWindow* self = (MainWindow*)emu::sdlcompat::mainWindow();
+    if (self) return self->handle(hwnd, msg, wParam, lParam);
+    return 0;
+}
+#endif
 
 PhoneProfile* MainWindow::findProfile(int id) {
     for (auto& p : state_.phones) if (p.id == id) return &p;
@@ -1119,33 +1554,18 @@ void MainWindow::sampleResources() {
             continue;
         }
 
-        DWORD pid = 0;
-        if (auto* android = dynamic_cast<AndroidVirtualMachine*>(vm)) pid = android->processId();
-        if (!pid) {
+        uint64_t total = 0;
+        size_t rssBytes = 0;
+        bool haveStats = false;
+        if (auto* android = dynamic_cast<AndroidVirtualMachine*>(vm)) {
+            haveStats = emu::platform::processStats(android->processId(), &total, &rssBytes);
+        }
+        if (!haveStats) {
             sample.cpuPercent = 0.0;
             sample.ramBytes = 0;
             sample.cpuTime = 0;
             continue;
         }
-
-        HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-        if (!h) h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-        if (!h) h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if (!h) {
-            sample.cpuPercent = 0.0;
-            sample.ramBytes = 0;
-            sample.cpuTime = 0;
-            continue;
-        }
-
-        FILETIME create{}, exit{}, kernel{}, user{};
-        ULONGLONG total = 0;
-        if (GetProcessTimes(h, &create, &exit, &kernel, &user)) {
-            total = fileTimeValue(kernel) + fileTimeValue(user);
-        }
-        PROCESS_MEMORY_COUNTERS pmc{};
-        if (!GetProcessMemoryInfo(h, &pmc, sizeof(pmc))) pmc.WorkingSetSize = 0;
-        CloseHandle(h);
 
         if (sample.cpuTime && total >= sample.cpuTime) {
             double pct = (double)(total - sample.cpuTime) * 100.0 / elapsed100ns / (double)cores;
@@ -1154,7 +1574,7 @@ void MainWindow::sampleResources() {
             sample.cpuPercent = 0.0;
         }
         sample.cpuTime = total;
-        sample.ramBytes = (size_t)pmc.WorkingSetSize;
+        sample.ramBytes = rssBytes;
     }
 }
 
@@ -1582,6 +2002,7 @@ void MainWindow::exitEverything() {
 }
 
 void MainWindow::installTrayIcon() {
+#ifdef _WIN32
     if (trayIcon_) return;
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
@@ -1592,9 +2013,17 @@ void MainWindow::installTrayIcon() {
     nid.hIcon = LoadIcon(hInst_, IDI_APPLICATION);
     wcscpy_s(nid.szTip, L"BlueDroid - phones still running");
     if (Shell_NotifyIconW(NIM_ADD, &nid)) trayIcon_ = true;
+#else
+    // SDL2 has no system tray API. hideToTray() minimizes instead, so phones
+    // keep running and the window remains reachable from the dock/taskbar.
+    (void)TRAY_ID;
+    (void)TRAY_MSG;
+    LOG_DEBUG("System tray icons are unavailable with the SDL backend");
+#endif
 }
 
 void MainWindow::removeTrayIcon() {
+#ifdef _WIN32
     if (!trayIcon_) return;
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
@@ -1602,11 +2031,20 @@ void MainWindow::removeTrayIcon() {
     nid.uID = TRAY_ID;
     Shell_NotifyIconW(NIM_DELETE, &nid);
     trayIcon_ = false;
+#else
+    trayIcon_ = false;
+#endif
 }
 
 void MainWindow::hideToTray() {
+#ifdef _WIN32
     installTrayIcon();
     ShowWindow(hwnd_, SW_HIDE);
+#else
+    // SDL2 has no system tray. Minimize instead of hiding so the manager can
+    // still be restored from the dock/taskbar while phones keep running.
+    ShowWindow(hwnd_, SW_MINIMIZE);
+#endif
 }
 
 void MainWindow::restoreFromTray() {
@@ -1634,13 +2072,17 @@ void MainWindow::toggleFullscreen() {
         GetWindowRect(hwnd_, &savedRect_);
         MONITORINFO mi{ sizeof(mi) };
         GetMonitorInfo(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi);
+#ifdef _WIN32
         SetWindowLongPtrW(hwnd_, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+#endif
         SetWindowPos(hwnd_, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
             mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
             SWP_FRAMECHANGED);
         fullscreen_ = true;
     } else {
+#ifdef _WIN32
         SetWindowLongPtrW(hwnd_, GWL_STYLE, kWindowStyle | WS_VISIBLE);
+#endif
         SetWindowPos(hwnd_, nullptr, savedRect_.left, savedRect_.top,
             savedRect_.right - savedRect_.left, savedRect_.bottom - savedRect_.top,
             SWP_FRAMECHANGED);
@@ -1829,6 +2271,7 @@ void MainWindow::ensurePhoneTexture(int id, int w, int h) {
     if (slot->texture && slot->w == w && slot->h == h) return;
     releaseTexture(slot.get(), renderer_->context);
 
+#ifdef _WIN32
     D3D11_TEXTURE2D_DESC td{};
     td.Width = (UINT)w;
     td.Height = (UINT)h;
@@ -1849,6 +2292,18 @@ void MainWindow::ensurePhoneTexture(int id, int w, int h) {
         releaseTexture(slot.get(), renderer_->context);
         return;
     }
+    slot->view = (ImTextureID)(uintptr_t)slot->srv;
+#else
+    glGenTextures(1, &slot->texture);
+    glBindTexture(GL_TEXTURE_2D, slot->texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    slot->view = (ImTextureID)(uintptr_t)slot->texture;
+#endif
     slot->w = w;
     slot->h = h;
 }
@@ -1857,10 +2312,11 @@ void MainWindow::updatePhoneTexture(int id, const uint8_t* rgba, int w, int h) {
     if (!renderer_ || !rgba || w <= 0 || h <= 0) return;
     ensurePhoneTexture(id, w, h);
     auto it = textures_.find(id);
-    if (it == textures_.end() || !it->second || !it->second->srv) return;
+    if (it == textures_.end() || !it->second || !it->second->view) return;
     PhoneTexture* tex = it->second.get();
     if (tex->w != w || tex->h != h) return;
 
+#ifdef _WIN32
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (FAILED(renderer_->context->Map(tex->texture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return;
     auto* dst = (uint8_t*)mapped.pData;
@@ -1869,11 +2325,21 @@ void MainWindow::updatePhoneTexture(int id, const uint8_t* rgba, int w, int h) {
         memcpy(dst + (size_t)y * mapped.RowPitch, rgba + (size_t)y * rowBytes, rowBytes);
     }
     renderer_->context->Unmap(tex->texture, 0);
+#else
+    glBindTexture(GL_TEXTURE_2D, tex->texture);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    glBindTexture(GL_TEXTURE_2D, 0);
+#endif
 }
 
 void MainWindow::renderFrame() {
+#ifdef _WIN32
     if (!renderer_ || !renderer_->context || !renderer_->rtv ||
         IsIconic(hwnd_) || !IsWindowVisible(hwnd_)) return;
+#else
+    if (!renderer_ || !renderer_->glContext ||
+        IsIconic(hwnd_) || !IsWindowVisible(hwnd_)) return;
+#endif
 
     update();
 
@@ -1905,6 +2371,7 @@ void MainWindow::renderFrame() {
     GetClientRect(hwnd_, &rc);
     UINT width = (UINT)std::max(1, (int)rc.right);
     UINT height = (UINT)std::max(1, (int)rc.bottom);
+#ifdef _WIN32
     const bool postShadersReady = renderer_->postVS && renderer_->postPS &&
         renderer_->postConstants && renderer_->postSampler;
     const bool usePost = postShadersReady && ensurePostTargets(width, height);
@@ -1929,6 +2396,16 @@ void MainWindow::renderFrame() {
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
     if (usePost) renderPostPass();
     renderer_->swapChain->Present(1, 0);
+#else
+    ImVec4 bg = hdr::V4(g_uiTheme.windowBg);
+    int drawableW = (int)width, drawableH = (int)height;
+    SDL_GL_GetDrawableSize((SDL_Window*)hwnd_, &drawableW, &drawableH);
+    glViewport(0, 0, (GLsizei)drawableW, (GLsizei)drawableH);
+    glClearColor(bg.x, bg.y, bg.z, bg.w);
+    glClear(GL_COLOR_BUFFER_BIT);
+    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    SDL_GL_SwapWindow((SDL_Window*)hwnd_);
+#endif
 }
 
 void MainWindow::drawManager() {
@@ -2193,9 +2670,9 @@ void MainWindow::drawCard(int id, float x, float y, float w, float h) {
         ensurePhoneTexture(id, pit->second.w, pit->second.h);
         updatePhoneTexture(id, pit->second.rgba.data(), pit->second.w, pit->second.h);
         auto tit = textures_.find(id);
-        if (tit != textures_.end() && tit->second && tit->second->srv) {
+        if (tit != textures_.end() && tit->second && tit->second->view) {
             ImGui::SetCursorScreenPos(screenA);
-            ImGui::Image((void*)tit->second->srv, ImVec2(screenB.x - screenA.x, screenB.y - screenA.y));
+            ImGui::Image(tit->second->view, ImVec2(screenB.x - screenA.x, screenB.y - screenA.y));
         }
     } else {
         ImU32 color = IM_COL32((p->color) & 0xFF, (p->color >> 8) & 0xFF, (p->color >> 16) & 0xFF, 255);
@@ -2956,7 +3433,7 @@ void MainWindow::drawEmulator() {
             if (!fb || sw <= 0 || sh <= 0) return;
             updatePhoneTexture(currentId_ ? currentId_ : -1, fb, sw, sh);
             auto tit = textures_.find(currentId_ ? currentId_ : -1);
-            if (tit == textures_.end() || !tit->second || !tit->second->srv) return;
+            if (tit == textures_.end() || !tit->second || !tit->second->view) return;
 
             ImVec2 avail(size.x, std::max(1.0f, size.y - toolbarH - statusH - 8));
             float aspect = (float)sw / (float)sh;
@@ -2965,7 +3442,7 @@ void MainWindow::drawEmulator() {
             else dh = avail.x / aspect;
             ImVec2 pos((avail.x - dw) * 0.5f, 8.0f + (avail.y - dh) * 0.5f);
             ImGui::SetCursorScreenPos(pos);
-            ImGui::Image((void*)tit->second->srv, ImVec2(dw, dh));
+            ImGui::Image(tit->second->view, ImVec2(dw, dh));
             phoneRect_ = { (LONG)pos.x, (LONG)pos.y, (LONG)(pos.x + dw), (LONG)(pos.y + dh) };
 
             // Invisible button gives the frame real hover/drag state; Image itself
@@ -3164,6 +3641,7 @@ void MainWindow::drawWindowControls() {
 }
 
 void MainWindow::chooseApkFile() {
+#ifdef _WIN32
     wchar_t file[MAX_PATH] = {};
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
@@ -3175,6 +3653,25 @@ void MainWindow::chooseApkFile() {
     ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
     ofn.lpstrTitle = L"Select an APK install file";
     if (GetOpenFileNameW(&ofn)) openApkPicker(toUtf8(file));
+#else
+    // zenity on Linux, osascript on macOS. Both print the chosen path on stdout.
+#ifdef __APPLE__
+    const char* command = "osascript -e 'POSIX path of (choose file)'";
+#else
+    const char* command = "zenity --file-selection --file-filter='*.apk' 2>/dev/null";
+#endif
+    std::string output;
+    int exitCode = -1;
+    if (!emu::platform::runCommand(command, 0, true, &output, &exitCode) || exitCode != 0) {
+        LOG_DEBUG("APK picker was cancelled or unavailable (exit %d)", exitCode);
+        return;
+    }
+    auto firstNonSpace = output.find_first_not_of(" \t\r\n\"");
+    if (firstNonSpace == std::string::npos) return;
+    auto lastNonSpace = output.find_last_not_of(" \t\r\n\"");
+    std::string path = output.substr(firstNonSpace, lastNonSpace - firstNonSpace + 1);
+    if (!path.empty()) openApkPicker(path);
+#endif
 }
 
 void MainWindow::openApkPicker(const std::string& path) {
@@ -3915,6 +4412,7 @@ LRESULT MainWindow::handle(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case WM_DROPFILES: {
             HDROP drop = (HDROP)wParam;
+#ifdef _WIN32
             UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
             bool opened = false;
             for (UINT i = 0; i < count && !opened; ++i) {
@@ -3933,6 +4431,16 @@ LRESULT MainWindow::handle(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 modalTitle_ = "Not an APK";
                 modalMessage_ = "Drop a file ending in .apk";
             }
+#else
+            const std::string path = emu::sdlcompat::dropPath(drop);
+            if (!path.empty() && isApkPath(path)) {
+                openApkPicker(path);
+            } else if (!path.empty()) {
+                showMessageModal_ = true;
+                modalTitle_ = "Not an APK";
+                modalMessage_ = "Drop a file ending in .apk";
+            }
+#endif
             DragFinish(drop);
             return 0;
         }

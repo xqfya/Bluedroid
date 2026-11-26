@@ -1,5 +1,6 @@
 #pragma once
 #include "emulator/vm.h"
+#include "emulator/platform.h"
 #include <string>
 #include <vector>
 #include <thread>
@@ -7,11 +8,7 @@
 #include <mutex>
 #include <functional>
 #include <cstddef>
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+#include <cstdint>
 
 namespace emu {
 
@@ -43,7 +40,7 @@ public:
     bool attached() const { return attachOnly_; }
     // Process that owns the emulator surface, used by the manager for live
     // CPU/RAM badges. Returns 0 when no emulator process is available.
-    DWORD processId() const { return emuPid_ ? emuPid_ : procId_; }
+    uint64_t processId() const { return emuPid_ ? emuPid_ : procId_; }
     bool isDeviceOnline();
     // Shut down an emulator that this VM is attached to but did not launch.
     void terminate();
@@ -79,11 +76,12 @@ private:
     void waitForBoot();
     void captureLoop();
     bool captureAdbFrame();
-    HWND findEmulatorWindow() const;
+    // Windows only: handle of the emulator's capture window (0 elsewhere).
+    uint64_t findEmulatorWindow() const;
     bool ensureInputShell();
     void writeInput(const std::string& cmd);
     void setBootStatus(const char* text, int percent = -1);
-    std::string runCmd(const std::string& cmd, DWORD timeoutMs = 10000);
+    std::string runCmd(const std::string& cmd, int timeoutMs = 10000);
     std::string adbPath_;
     std::string emulatorPath_;
     std::string emulatorCheckPath_;
@@ -100,12 +98,11 @@ private:
     std::thread capThread_;
     std::atomic<bool> running_{false};
     mutable std::mutex fbMtx_;
-    HANDLE procHandle_ = nullptr;
-    DWORD procId_ = 0;
-    HWND emuHwnd_ = nullptr;
-    DWORD emuPid_ = 0;
-    HANDLE inputProc_ = nullptr;
-    HANDLE inputStdin_ = nullptr;
+    emu::platform::Process proc_;
+    uint64_t procId_ = 0;
+    uint64_t emuHwnd_ = 0;
+    uint64_t emuPid_ = 0;
+    emu::platform::Process inputProc_;
     std::mutex inputMtx_;
     int screenW_ = 1080;
     int screenH_ = 1920;

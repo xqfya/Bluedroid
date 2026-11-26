@@ -6,8 +6,12 @@ namespace emu {
 
 static std::string findQemu() {
     // very light probe
+#ifdef _WIN32
     const char* cands[] = { "qemu-system-x86_64", "qemu-system-x86_64.exe",
                             "C:\\Program Files\\qemu\\qemu-system-x86_64.exe" };
+#else
+    const char* cands[] = { "qemu-system-x86_64" };
+#endif
     for (auto c : cands) {
         // We can't easily check; just return first candidate name and let start() fail.
     }

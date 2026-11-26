@@ -4,7 +4,8 @@
 
 namespace emu {
 
-// Renders the VM framebuffer to a host window using GDI (Windows) or OpenGL.
+// Renders the VM framebuffer to a host window using GDI (Windows); other
+// platforms report a "stub" backend because the UI layer owns the blit.
 class Renderer {
 public:
     Renderer();

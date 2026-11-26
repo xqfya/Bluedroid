@@ -5,6 +5,7 @@
 #include "emulator/app_setup.h"
 #include "emulator/logger.h"
 #include "emulator/config.h"
+#include "emulator/platform.h"
 
 #include <algorithm>
 #include <cctype>
@@ -20,19 +21,22 @@
 #include <cwchar>
 #include <thread>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace emu {
 
+namespace fs = std::filesystem;
+
 static void runAsync(const std::string& cmd) {
-    // Launch adb directly (no cmd.exe) with no console window at all.
-    STARTUPINFOA si{}; si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi{};
-    std::vector<char> buf(cmd.begin(), cmd.end());
-    buf.push_back(0);
-    if (CreateProcessA(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-    }
+    // Hidden, detached launch. On Windows this is CreateProcessA with
+    // CREATE_NO_WINDOW; on POSIX it is /bin/sh with /dev/null stdio.
+    emu::platform::Process process;
+    process.start(cmd, false, false, true);
 }
 
 static std::string getenvStr(const char* name) {
@@ -41,6 +45,16 @@ static std::string getenvStr(const char* name) {
 }
 
 namespace {
+
+static const char* pathSep() {
+#ifdef _WIN32
+    return "\\";
+#else
+    return "/";
+#endif
+}
+
+#ifdef _WIN32
 
 struct FindEmuCtx {
     std::wstring avd;
@@ -108,6 +122,8 @@ static void keepEmulatorHidden(HWND hwnd, DWORD pid) {
     EnumWindows(hideEmuWindowProc, reinterpret_cast<LPARAM>(&ctx));
 }
 
+#endif // _WIN32
+
 static void trimIniWhitespace(std::string& s) {
     size_t first = s.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) { s.clear(); return; }
@@ -169,13 +185,15 @@ static void applyAvdStoragePaths(const std::string& iniPath, const std::string& 
     bool changed = false;
     // <temp> is Android's "do not persist this data" marker. Point it at the
     // AVD's own image so apps, accounts and settings survive a phone restart.
-    changed |= setIniValue(lines, "disk.dataPartition.path", avdDir + "\\userdata-qemu.img");
+    const fs::path avd = fs::path(avdDir);
+    changed |= setIniValue(lines, "disk.dataPartition.path",
+                           (avd / "userdata-qemu.img").string());
 
     if (!changed && in) return;
     std::ofstream out(iniPath, std::ios::trunc);
     for (const auto& line : lines) out << line << "\n";
     std::error_code ec;
-    std::filesystem::create_directories(avdDir + "\\snapshots", ec);
+    fs::create_directories(avd / "snapshots", ec);
 }
 
 static void applyAvdHardware(const std::string& iniPath, const VmSpec& spec) {
@@ -213,12 +231,14 @@ static void applyAvdHardware(const std::string& iniPath, const VmSpec& spec) {
 // them directly so the emulator never needs the JDK or command-line tools.
 static bool writeNativeAvd(const std::string& avdBase, const std::string& name,
                            const std::string& avdDir, const VmSpec& spec) {
-    namespace fs = std::filesystem;
     std::error_code ec;
-    fs::create_directories(avdDir, ec);
-    fs::create_directories(avdDir + "\\snapshots", ec);
+    const fs::path avd = fs::path(avdDir);
+    fs::create_directories(avd, ec);
+    fs::create_directories(avd / "snapshots", ec);
+    const std::string sep = pathSep();
 
-    const std::string iniPath = avdBase + "\\" + name + ".ini";
+    const fs::path descriptor = fs::path(avdBase) / (name + ".ini");
+    const std::string iniPath = descriptor.string();
     std::ofstream ini(iniPath, std::ios::trunc);
     if (!ini) {
         LOG_ERROR("Could not write AVD descriptor %s", iniPath.c_str());
@@ -226,7 +246,7 @@ static bool writeNativeAvd(const std::string& avdBase, const std::string& name,
     }
     ini << "avd.ini.encoding=UTF-8\n"
         << "path=" << avdDir << "\n"
-        << "path.rel=avd\\" << name << ".avd\n"
+        << "path.rel=avd" << sep << name << ".avd\n"
         << "target=android-33\n";
     if (!ini) {
         LOG_ERROR("Could not finish AVD descriptor %s", iniPath.c_str());
@@ -239,9 +259,10 @@ static bool writeNativeAvd(const std::string& avdBase, const std::string& name,
     const int height = spec.screenHeight > 0 ? spec.screenHeight : 1920;
     const int dpi = spec.dpi > 0 ? spec.dpi : 320;
 
-    std::ofstream cfg(avdDir + "\\config.ini", std::ios::trunc);
+    const fs::path config = avd / "config.ini";
+    std::ofstream cfg(config.string(), std::ios::trunc);
     if (!cfg) {
-        LOG_ERROR("Could not write AVD config %s\\config.ini", avdDir.c_str());
+        LOG_ERROR("Could not write AVD config %s", config.string().c_str());
         return false;
     }
     cfg << "avd.ini.encoding=UTF-8\n"
@@ -251,7 +272,7 @@ static bool writeNativeAvd(const std::string& avdBase, const std::string& name,
         << "avd.name=<build>\n"
         << "disk.cachePartition=yes\n"
         << "disk.cachePartition.size=66MB\n"
-        << "disk.dataPartition.path=" << avdDir << "\\userdata-qemu.img\n"
+        << "disk.dataPartition.path=" << (avd / "userdata-qemu.img").string() << "\n"
         << "disk.dataPartition.size=6442450944\n"
         << "hw.accelerometer=yes\n"
         << "hw.audioInput=yes\n"
@@ -275,12 +296,13 @@ static bool writeNativeAvd(const std::string& avdBase, const std::string& name,
         << "hw.tactile=yes\n"
         << "hw.usb=yes\n"
         << "hw.wifi=yes\n"
-        << "image.sysdir.1=system-images\\android-33\\google_apis_playstore\\x86_64\\\n"
+        << "image.sysdir.1=system-images" << sep << "android-33" << sep
+        << "google_apis_playstore" << sep << "x86_64" << sep << "\n"
         << "tag.display=Google Play\n"
         << "tag.id=google_apis_playstore\n"
         << "vm.heapSize=" << std::max(64, ram / 8) << "\n";
     if (!cfg) {
-        LOG_ERROR("Could not finish AVD config %s\\config.ini", avdDir.c_str());
+        LOG_ERROR("Could not finish AVD config %s", config.string().c_str());
         return false;
     }
     LOG_INFO("Created AVD descriptor %s", iniPath.c_str());
@@ -344,7 +366,7 @@ static bool copyFileIfChanged(const std::string& src, const std::string& dst) {
 
 AndroidVirtualMachine::AndroidVirtualMachine() {
     tmpDir_ = AppSetup::tempDir();
-    framePath_ = tmpDir_ + "\\frame.png";
+    framePath_ = (fs::path(tmpDir_) / "frame.png").string();
 }
 
 AndroidVirtualMachine::~AndroidVirtualMachine() {
@@ -365,7 +387,8 @@ void AndroidVirtualMachine::configure(const std::string& avdName, int port, bool
     serial_ = "emulator-" + std::to_string(port_);
     attachOnly_ = attachExisting;
     // Each phone needs its own scratch frame in the ADB fallback path.
-    framePath_ = tmpDir_ + "\\frame_" + std::to_string(port_) + ".png";
+    framePath_ = (fs::path(tmpDir_) /
+                  ("frame_" + std::to_string(port_) + ".png")).string();
 }
 
 bool AndroidVirtualMachine::isDeviceOnline() {
@@ -398,13 +421,13 @@ bool AndroidVirtualMachine::installApk(const std::string& apkPath,
     // so the saved file is exactly what was pushed to this phone.
     const std::string store = apkStoreDir();
     const std::string apkFileName = apkRemoteName(apkPath);
-    const std::string storedApk = store + "\\" + apkFileName;
+    const std::string storedApk = (fs::path(store) / apkFileName).string();
     std::string sourceApk = apkPath;
     if (copyFileIfChanged(apkPath, storedApk)) {
         // Install from the saved copy so the phone library is exactly what was
         // installed, even if the original dragged file is later moved/deleted.
         sourceApk = storedApk;
-        std::ofstream manifest(store + "\\installed.txt", std::ios::app);
+        std::ofstream manifest((fs::path(store) / "installed.txt").string(), std::ios::app);
         if (manifest) {
             char stamp[32] = {};
             std::time_t now = std::time(nullptr);
@@ -440,41 +463,14 @@ bool AndroidVirtualMachine::installApk(const std::string& apkPath,
     // in an APK. Base64 is pure ASCII, so every block really reaches the phone.
     // Progress is counted from APK bytes represented by successfully written
     // blocks, never from a timer.
-    SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
-    HANDLE hRead = nullptr, hWrite = nullptr;
-    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
-        report(0, total, "Could not open transfer pipe");
-        return false;
-    }
-    // The child inherits the READ end as its stdin. The parent keeps the WRITE
-    // end, so clear inherit on hWrite (the opposite of runCmd()).
-    SetHandleInformation(hWrite, HANDLE_FLAG_INHERIT, 0);
-    SECURITY_ATTRIBUTES nulSa{}; nulSa.nLength = sizeof(nulSa);
-    nulSa.bInheritHandle = TRUE;
-    HANDLE hNul = CreateFileA("NUL", GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, &nulSa, OPEN_EXISTING, 0, nullptr);
-
-    STARTUPINFOA si{}; si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    si.hStdInput = hRead;
-    si.hStdOutput = hNul;
-    si.hStdError = hNul;
-
     const std::string cmd = "\"" + adbPath_ + "\" -s " + serial_ +
         " shell toybox base64 -d > " + remote;
-    std::vector<char> buf(cmd.begin(), cmd.end()); buf.push_back(0);
-    PROCESS_INFORMATION pi{};
-    bool ok = CreateProcessA(nullptr, buf.data(), nullptr, nullptr, TRUE,
-        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi) != FALSE;
-    CloseHandle(hRead);
-    if (hNul) CloseHandle(hNul);
+    emu::platform::Process transfer;
+    bool ok = transfer.start(cmd, true, false, true);
     if (!ok) {
-        CloseHandle(hWrite);
         report(0, total, "ADB transfer failed to start");
         return false;
     }
-    CloseHandle(pi.hThread);
 
     // Divisible by three, so only the final block needs base64 padding.
     const size_t chunk = 48 * 1024;
@@ -485,7 +481,7 @@ bool AndroidVirtualMachine::installApk(const std::string& apkPath,
 
     while (done < total) {
         if (cancel && cancel->load()) { cancelled = true; break; }
-        if (WaitForSingleObject(pi.hProcess, 0) != WAIT_TIMEOUT) break;
+        if (!transfer.running()) break;
 
         const size_t want = std::min(chunk, total - done);
         in.read(raw.data(), (std::streamsize)want);
@@ -496,35 +492,28 @@ bool AndroidVirtualMachine::installApk(const std::string& apkPath,
         encoded.reserve(((size_t)got + 2) / 3 * 4);
         appendBase64(raw.data(), (size_t)got, encoded);
 
-        DWORD off = 0;
-        while (off < (DWORD)encoded.size()) {
-            DWORD written = 0;
-            if (!WriteFile(hWrite, encoded.data() + off, (DWORD)encoded.size() - off,
-                           &written, nullptr) || written == 0) {
-                ok = false;
-                break;
-            }
-            off += written;
+        // writeStdin is binary-safe on both Windows and POSIX.
+        if (!transfer.writeStdin(encoded.data(), encoded.size(), 15000)) {
+            ok = false;
+            break;
         }
-        if (!ok) break;
         done += (size_t)got;
         report(done, total, "Uploading APK");
     }
 
-    if (hWrite) CloseHandle(hWrite);
-    const DWORD wait = WaitForSingleObject(pi.hProcess, cancelled ? 2000 : 60000);
-    DWORD exitCode = 0;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hProcess);
+    transfer.close(); // signals EOF to the remote base64 decoder
+    bool timedOut = false;
+    const int exitCode = transfer.wait(cancelled ? 2000 : 60000, &timedOut);
 
     if (cancelled) {
+        transfer.terminate(true);
         removeRemote();
         report(done, total, "Cancelled");
         return false;
     }
-    if (!ok || wait == WAIT_TIMEOUT || exitCode != 0 || done != total) {
-        LOG_WARN("APK transfer failed: ok=%d wait=%lu exit=%lu done=%zu/%zu",
-                 (int)ok, (unsigned long)wait, (unsigned long)exitCode, done, total);
+    if (!ok || timedOut || exitCode != 0 || done != total) {
+        LOG_WARN("APK transfer failed: ok=%d timeout=%d exit=%d done=%zu/%zu",
+                 (int)ok, (int)timedOut, exitCode, done, total);
         removeRemote();
         report(done, total, "Upload failed");
         return false;
@@ -559,35 +548,55 @@ bool AndroidVirtualMachine::installApk(const std::string& apkPath,
 }
 
 bool AndroidVirtualMachine::findSdk() {
-    auto usable = [](const std::string& candidate) {
+    const std::string suffix = emu::platform::exeSuffix();
+    const std::string adbName = "adb" + suffix;
+    const std::string emulatorName = "emulator" + suffix;
+    const std::string checkName = "emulator-check" + suffix;
+    auto usable = [&](const fs::path& candidate) {
         if (candidate.empty()) return false;
-        std::ifstream adb(candidate + "\\platform-tools\\adb.exe");
-        std::ifstream emu(candidate + "\\emulator\\emulator.exe");
-        return bool(adb) && bool(emu);
+        std::error_code ec;
+        return fs::is_regular_file(candidate / "platform-tools" / adbName, ec) &&
+               fs::is_regular_file(candidate / "emulator" / emulatorName, ec);
     };
 
     // AppSetup publishes these variables for every child process. Prefer a
-    // usable SDK from the environment, then the old system location, then the
+    // usable SDK from the environment, then the system location, then the
     // per-user SDK installed by bootstrap.
+#ifdef _WIN32
+    const fs::path systemSdk("C:\\AndroidSDK");
+#else
+    const fs::path systemSdk("/opt/android-sdk");
+#endif
     const std::string envRoot = getenvStr("ANDROID_SDK_ROOT");
     const std::string envHome = getenvStr("ANDROID_HOME");
-    std::string root;
-    if (usable(envRoot)) root = envRoot;
-    else if (usable(envHome)) root = envHome;
-    else if (usable("C:\\AndroidSDK")) root = "C:\\AndroidSDK";
-    else if (usable(AppSetup::sdkDir())) root = AppSetup::sdkDir();
-    else if (!envRoot.empty()) root = envRoot; // keep the existing diagnostics
-    else if (!envHome.empty()) root = envHome;
-    else root = "C:\\AndroidSDK";
+    const fs::path candidates[] = {
+        fs::path(envRoot), fs::path(envHome), systemSdk, fs::path(AppSetup::sdkDir())
+    };
+    fs::path root;
+    for (const fs::path& candidate : candidates) {
+        if (usable(candidate)) { root = candidate; break; }
+    }
+    if (root.empty()) {
+        // Keep the existing diagnostics pointing at the most useful location.
+        if (!envRoot.empty()) root = envRoot;
+        else if (!envHome.empty()) root = envHome;
+        else root = systemSdk;
+    }
 
-    sdkRoot_ = root;
-    adbPath_ = root + "\\platform-tools\\adb.exe";
-    emulatorPath_ = root + "\\emulator\\emulator.exe";
-    emulatorCheckPath_ = root + "\\emulator\\emulator-check.exe";
+    sdkRoot_ = root.string();
+    adbPath_ = (root / "platform-tools" / adbName).string();
+    emulatorPath_ = (root / "emulator" / emulatorName).string();
+    emulatorCheckPath_ = (root / "emulator" / checkName).string();
     std::ifstream f1(adbPath_); if (!f1) { LOG_ERROR("adb not found at %s", adbPath_.c_str()); return false; }
     std::ifstream f2(emulatorPath_); if (!f2) { LOG_ERROR("emulator not found at %s", emulatorPath_.c_str()); return false; }
     std::string avdHome = getenvStr("ANDROID_AVD_HOME");
-    if (avdHome.empty()) avdHome = getenvStr("USERPROFILE") + "\\.android\\avd";
+    if (avdHome.empty()) {
+#ifdef _WIN32
+        avdHome = (fs::path(getenvStr("USERPROFILE")) / ".android" / "avd").string();
+#else
+        avdHome = (fs::path(getenvStr("HOME")) / ".android" / "avd").string();
+#endif
+    }
     LOG_INFO("SDK root: %s", sdkRoot_.c_str());
     LOG_INFO("AVD home: %s", avdHome.c_str());
     return true;
@@ -598,11 +607,13 @@ bool AndroidVirtualMachine::ensureAvd() {
     // descriptor and config are written natively; no avdmanager/JDK is needed.
     std::string avdBase = getenvStr("ANDROID_AVD_HOME");
     if (avdBase.empty()) avdBase = AppSetup::avdDir();
-    if (!avdBase.empty() && avdBase.back() != '\\' && avdBase.back() != '/') avdBase += '\\';
     std::error_code ec;
-    std::filesystem::create_directories(avdBase, ec);
-    const std::string avdDir = avdBase + avdName_ + ".avd";
-    const std::string configPath = avdDir + "\\config.ini";
+    const fs::path avdRoot(avdBase);
+    fs::create_directories(avdRoot, ec);
+    const fs::path avd = avdRoot / (avdName_ + ".avd");
+    avdBase = avdRoot.string();
+    const std::string avdDir = avd.string();
+    const std::string configPath = (avd / "config.ini").string();
     std::ifstream f(configPath);
     if (f) {
         f.close();
@@ -625,37 +636,22 @@ bool AndroidVirtualMachine::ensureAvd() {
     return true;
 }
 
-std::string AndroidVirtualMachine::runCmd(const std::string& cmd, DWORD timeoutMs) {
+std::string AndroidVirtualMachine::runCmd(const std::string& cmd, int timeoutMs) {
     std::string result;
-    SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
-    HANDLE hRead = nullptr, hWrite = nullptr;
-    if (CreatePipe(&hRead, &hWrite, &sa, 0)) {
-        SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
-        STARTUPINFOA si{}; si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
-        si.hStdOutput = hWrite; si.hStdError = hWrite;
-        PROCESS_INFORMATION pi{};
-        std::vector<char> b(cmd.begin(), cmd.end()); b.push_back(0);
-        if (CreateProcessA(nullptr, b.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-            CloseHandle(hWrite); hWrite = nullptr;
-            char tmp[4096]; DWORD n = 0;
-            while (ReadFile(hRead, tmp, sizeof(tmp), &n, nullptr) && n > 0) {
-                result.append(tmp, n);
-            }
-            WaitForSingleObject(pi.hProcess, timeoutMs);
-            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-        }
-        if (hRead) CloseHandle(hRead);
-        if (hWrite) CloseHandle(hWrite);
-    }
+    emu::platform::runCommand(cmd, timeoutMs, true, &result, nullptr);
     return result;
 }
 
 bool AndroidVirtualMachine::checkAcceleration() {
+#ifdef _WIN32
     const std::string warning =
         "Virtualization unavailable: enable VT-x/AMD-V in BIOS or Windows "
         "Hypervisor Platform, then restart BlueDroid.";
+#else
+    const std::string warning =
+        "Virtualization unavailable: enable KVM in BIOS and kernel support, "
+        "then restart BlueDroid.";
+#endif
 
     std::ifstream present(emulatorCheckPath_);
     if (!present) {
@@ -711,27 +707,26 @@ bool AndroidVirtualMachine::checkAcceleration() {
 
 void AndroidVirtualMachine::launchEmulator() {
     std::ostringstream cmd;
-    // Keep a real window (moved offscreen later) - PrintWindow on this surface
-    // is dramatically faster than taking an ADB PNG screenshot every frame.
+    // Windows keeps its real (offscreen) window for PrintWindow capture. POSIX
+    // has no capture window and uses adb's screencap instead.
     cmd << "\"" << emulatorPath_ << "\" -avd " << avdName_
         << " -port " << port_ << " -gpu " << gpuModeName(spec_.gpuMode)
         << " -no-snapshot";
+#ifndef _WIN32
+    // Hidden processes are a core BlueDroid feature on every OS. POSIX has no
+    // capture window: frames come from adb screencap, so the emulator itself
+    // never needs to open a visible QEMU window.
+    cmd << " -no-window";
+#endif
     if (spec_.ramMB > 0) cmd << " -memory " << spec_.ramMB;
     LOG_INFO("Launching: %s", cmd.str().c_str());
 
-    STARTUPINFOA si{}; si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-    std::string c = cmd.str();
-    std::vector<char> buf(c.begin(), c.end());
-    buf.push_back(0);
-    if (CreateProcessA(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        procHandle_ = pi.hProcess;
-        procId_ = pi.dwProcessId;
-        CloseHandle(pi.hThread);
-        LOG_INFO("Emulator launched pid=%lu", procId_);
+    if (proc_.start(cmd.str(), false, false, true)) {
+        procId_ = proc_.id();
+        LOG_INFO("Emulator launched pid=%llu", (unsigned long long)procId_);
     } else {
         err_ = "Failed to launch emulator";
-        LOG_ERROR("CreateProcess failed: %lu", GetLastError());
+        LOG_ERROR("Could not launch emulator process");
     }
 }
 
@@ -776,7 +771,8 @@ void AndroidVirtualMachine::waitForBoot() {
     LOG_WARN("Boot wait timed out");
 }
 
-HWND AndroidVirtualMachine::findEmulatorWindow() const {
+uint64_t AndroidVirtualMachine::findEmulatorWindow() const {
+#ifdef _WIN32
     FindEmuCtx ctx;
     ctx.avd.assign(avdName_.begin(), avdName_.end());
     auto dash = serial_.find('-');
@@ -785,68 +781,33 @@ HWND AndroidVirtualMachine::findEmulatorWindow() const {
         ctx.port.assign(port.begin(), port.end());
     }
     EnumWindows(findEmuWindowProc, reinterpret_cast<LPARAM>(&ctx));
-    return ctx.hwnd;
+    return (uint64_t)ctx.hwnd;
+#else
+    return 0; // No host window on POSIX; capture comes from adb.
+#endif
 }
 
 bool AndroidVirtualMachine::ensureInputShell() {
-    if (inputStdin_ && inputProc_) {
-        if (WaitForSingleObject(inputProc_, 0) == WAIT_TIMEOUT) return true;
-        CloseHandle(inputStdin_); inputStdin_ = nullptr;
-        CloseHandle(inputProc_); inputProc_ = nullptr;
-    }
+    if (inputProc_.running()) return true;
+    inputProc_.terminate(true);
 
-    SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
-    HANDLE hRead = nullptr, hWrite = nullptr;
-    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return false;
-    SetHandleInformation(hWrite, HANDLE_FLAG_INHERIT, 0);
-
-    HANDLE hNul = CreateFileA("NUL", GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-
-    STARTUPINFOA si{}; si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    si.hStdInput = hRead;
-    si.hStdOutput = hNul;
-    si.hStdError = hNul;
-
-    std::string cmd = adbPath_ + " -s " + serial_ + " shell";
-    std::vector<char> buf(cmd.begin(), cmd.end());
-    buf.push_back(0);
-    PROCESS_INFORMATION pi{};
-    bool ok = CreateProcessA(nullptr, buf.data(), nullptr, nullptr, TRUE,
-        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi) != FALSE;
-    CloseHandle(hRead);
-    if (hNul) CloseHandle(hNul);
-
-    if (!ok) {
-        CloseHandle(hWrite);
-        return false;
-    }
-    CloseHandle(pi.hThread);
-    inputStdin_ = hWrite;
-    inputProc_ = pi.hProcess;
+    const std::string cmd = "\"" + adbPath_ + "\" -s " + serial_ + " shell";
+    if (!inputProc_.start(cmd, true, false, true)) return false;
     LOG_INFO("Persistent input shell ready");
     return true;
 }
 
 void AndroidVirtualMachine::writeInput(const std::string& cmd) {
     std::lock_guard<std::mutex> lk(inputMtx_);
-    std::string line = cmd + "\n";
+    const std::string line = cmd + "\n";
 
-    auto send = [&]() {
-        DWORD written = 0;
-        return inputStdin_ != nullptr &&
-               WriteFile(inputStdin_, line.data(), (DWORD)line.size(), &written, nullptr) &&
-               written == line.size();
-    };
+    auto send = [&]() { return inputProc_.writeStdin(line.data(), line.size(), 3000); };
 
     if (!ensureInputShell()) { runAsync(cmd); return; }
     if (send()) return;
 
     // Pipe may have gone stale; restart the shell and retry once.
-    if (inputStdin_) { CloseHandle(inputStdin_); inputStdin_ = nullptr; }
-    if (inputProc_) { TerminateProcess(inputProc_, 0); CloseHandle(inputProc_); inputProc_ = nullptr; }
+    inputProc_.terminate(true);
     if (ensureInputShell() && send()) return;
     runAsync(cmd);
 }
@@ -880,7 +841,7 @@ bool AndroidVirtualMachine::start() {
         // VT-x/AMD-V or Windows Hypervisor Platform is not usable.
         checkAcceleration();
         launchEmulator();
-        if (!procHandle_) { state_ = VmState::Error; return false; }
+        if (procId_ == 0) { state_ = VmState::Error; return false; }
     }
     running_ = true;
     capThread_ = std::thread(&AndroidVirtualMachine::captureLoop, this);
@@ -894,47 +855,35 @@ void AndroidVirtualMachine::resume() { state_ = VmState::Running; }
 void AndroidVirtualMachine::stop() {
     running_ = false;
 
-    // The capture thread may be inside PrintWindow() on the emulator surface.
-    // PrintWindow can block while that window is alive, so tear the emulator
-    // down BEFORE joining. For attached VMs terminate() already did this.
+    // On Windows the capture thread may be inside PrintWindow(); tear the
+    // emulator down BEFORE joining. Attached VMs were already killed by
+    // terminate().
     if (!attachOnly_) {
+#ifdef _WIN32
         if (emuHwnd_) {
-            PostMessageA(emuHwnd_, WM_CLOSE, 0, 0);
-            emuHwnd_ = nullptr;
+            PostMessageA(reinterpret_cast<HWND>(emuHwnd_), WM_CLOSE, 0, 0);
+            emuHwnd_ = 0;
         }
-        // The launcher spawns a separate qemu child that owns the window. Kill
-        // both process trees or the device stays alive and adb reports offline.
-        if (procId_) {
-            runCmd("\"C:\\Windows\\System32\\taskkill.exe\" /PID " +
-                   std::to_string(procId_) + " /T /F");
-        }
-        if (emuPid_ && emuPid_ != procId_) {
-            runCmd("\"C:\\Windows\\System32\\taskkill.exe\" /PID " +
-                   std::to_string(emuPid_) + " /T /F");
-        }
-        if (emuPid_) {
-            HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, emuPid_);
-            if (h) { TerminateProcess(h, 0); CloseHandle(h); }
-            emuPid_ = 0;
-        }
-        if (procHandle_) {
-            TerminateProcess(procHandle_, 0);
-            CloseHandle(procHandle_);
-            procHandle_ = nullptr;
-        }
+#else
+        // Graceful shutdown: adb asks the emulator to save state and exit.
+        if (!adbPath_.empty())
+            runCmd("\"" + adbPath_ + "\" -s " + serial_ + " emu kill", 5000);
+#endif
+        // The launcher spawns a separate qemu child. Kill both process trees
+        // (taskkill /T /F on Windows, kill(-pgid) on POSIX).
+        if (procId_) emu::platform::terminateTree(procId_);
+        if (emuPid_ && emuPid_ != procId_) emu::platform::terminateTree(emuPid_);
+        proc_.terminate(true);
+        emuPid_ = 0;
+        procId_ = 0;
     } else {
-        emuHwnd_ = nullptr;
+        emuHwnd_ = 0;
         emuPid_ = 0;
     }
 
     if (capThread_.joinable()) capThread_.join();
 
-    if (inputStdin_) { CloseHandle(inputStdin_); inputStdin_ = nullptr; }
-    if (inputProc_) {
-        TerminateProcess(inputProc_, 0);
-        CloseHandle(inputProc_);
-        inputProc_ = nullptr;
-    }
+    inputProc_.terminate(true);
     state_ = VmState::Stopped;
     LOG_INFO("Android VM stopped%s", attachOnly_ ? " (detached)" : "");
 }
@@ -943,15 +892,14 @@ void AndroidVirtualMachine::terminate() {
     if (attachOnly_) {
         if (adbPath_.empty()) findSdk();
         runAsync("\"" + adbPath_ + "\" -s " + serial_ + " emu kill");
+#ifdef _WIN32
         if (emuHwnd_) {
-            PostMessageA(emuHwnd_, WM_CLOSE, 0, 0);
-            emuHwnd_ = nullptr;
+            PostMessageA(reinterpret_cast<HWND>(emuHwnd_), WM_CLOSE, 0, 0);
+            emuHwnd_ = 0;
         }
+#endif
         if (emuPid_) {
-            runCmd("\"C:\\Windows\\System32\\taskkill.exe\" /PID " +
-                   std::to_string(emuPid_) + " /T /F");
-            HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, emuPid_);
-            if (h) { TerminateProcess(h, 0); CloseHandle(h); }
+            emu::platform::terminateTree(emuPid_);
             emuPid_ = 0;
         }
         LOG_INFO("Terminated attached emulator %s", serial_.c_str());
@@ -967,34 +915,19 @@ void AndroidVirtualMachine::readFrame(const std::function<void(const uint8_t*, i
 }
 
 bool AndroidVirtualMachine::captureAdbFrame() {
-    // Slow fallback used only if the emulator window cannot be captured.
-    std::string cmd = adbPath_ + " -s " + serial_ + " exec-out screencap -p";
-    std::vector<unsigned char> buf;
-    SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
-    HANDLE hRead = nullptr, hWrite = nullptr;
-    if (CreatePipe(&hRead, &hWrite, &sa, 0)) {
-        SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
-        STARTUPINFOA si{}; si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
-        si.hStdOutput = hWrite; si.hStdError = hWrite;
-        PROCESS_INFORMATION pi{};
-        std::vector<char> cbuf(cmd.begin(), cmd.end()); cbuf.push_back(0);
-        if (CreateProcessA(nullptr, cbuf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-            CloseHandle(hWrite); hWrite = nullptr;
-            char tmp[65536]; DWORD n = 0;
-            while (ReadFile(hRead, tmp, sizeof(tmp), &n, nullptr) && n > 0) {
-                buf.insert(buf.end(), tmp, tmp + n);
-            }
-            WaitForSingleObject(pi.hProcess, 10000);
-            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-        }
-        if (hRead) CloseHandle(hRead);
-        if (hWrite) CloseHandle(hWrite);
-    }
-    if (buf.empty()) return false;
+    // Hidden adb exec-out screencap -p: binary-safe pipe on every platform.
+    const std::string cmd = "\"" + adbPath_ + "\" -s " + serial_ +
+                            " exec-out screencap -p";
+    emu::platform::Process process;
+    if (!process.start(cmd, false, true, true)) return false;
+    const std::string bytes = process.readAllStdout(10000);
+    bool timedOut = false;
+    process.wait(1000, &timedOut);
+    if (timedOut) process.terminate(true);
+    if (bytes.empty()) return false;
+    const auto* buf = reinterpret_cast<const unsigned char*>(bytes.data());
     int cw = 0, ch = 0, c = 0;
-    unsigned char* img = stbi_load_from_memory(buf.data(), (int)buf.size(), &cw, &ch, &c, 4);
+    unsigned char* img = stbi_load_from_memory(buf, (int)bytes.size(), &cw, &ch, &c, 4);
     if (!img) return false;
     std::lock_guard<std::mutex> lk(fbMtx_);
     if (w_ != cw || h_ != ch) {
@@ -1010,31 +943,40 @@ bool AndroidVirtualMachine::captureAdbFrame() {
 }
 
 void AndroidVirtualMachine::captureLoop() {
+#ifdef _WIN32
     setBootStatus("Waiting for emulator window");
+#else
+    setBootStatus("Waiting for Android");
+#endif
     waitForBoot();
     if (!running_) return;
     state_ = VmState::Running;
     setBootStatus("Emulator ready", 100);
     LOG_INFO("Android VM running");
 
+#ifdef _WIN32
     // Find and hide the capture surface immediately. ADB queries below can take
     // tens of seconds; doing them first used to leave Qt's window on top of
     // BlueDroid and steal mouse clicks.
     for (int i = 0; i < 300 && running_ && !emuHwnd_; ++i) {
         emuHwnd_ = findEmulatorWindow();
         if (emuHwnd_) {
-            GetWindowThreadProcessId(emuHwnd_, &emuPid_);
-            keepEmulatorHidden(emuHwnd_, emuPid_);
-            LOG_INFO("Capturing emulator window hwnd=%p pid=%lu (hidden from taskbar)",
-                (void*)emuHwnd_, emuPid_);
+            HWND hwnd = reinterpret_cast<HWND>(emuHwnd_);
+            DWORD windowPid = 0;
+            GetWindowThreadProcessId(hwnd, &windowPid);
+            emuPid_ = windowPid;
+            keepEmulatorHidden(hwnd, windowPid);
+            LOG_INFO("Capturing emulator window hwnd=%p pid=%llu (hidden from taskbar)",
+                (void*)hwnd, (unsigned long long)emuPid_);
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+#endif
 
     // Use the real Android display size for input mapping (the captured
-    // window surface can be scaled independently).
-    std::string sizeOut = runCmd(adbPath_ + " -s " + serial_ + " shell wm size");
+    // surface can be scaled independently).
+    std::string sizeOut = runCmd("\"" + adbPath_ + "\" -s " + serial_ + " shell wm size");
     unsigned sw = 0, sh = 0;
     if (std::sscanf(sizeOut.c_str(), "Physical size: %ux%u", &sw, &sh) == 2 && sw > 0 && sh > 0) {
         screenW_ = (int)sw;
@@ -1042,12 +984,13 @@ void AndroidVirtualMachine::captureLoop() {
         LOG_INFO("Logical screen %dx%d", screenW_, screenH_);
     }
 
-    // One hidden shell for all taps/swipes/keys - avoids spawning adb.exe on
-    // every input event and removes the noticeable click delay.
+    // One hidden shell for all taps/swipes/keys - avoids spawning adb on every
+    // input event and removes the noticeable click delay.
     if (!ensureInputShell()) {
         LOG_WARN("Persistent input shell unavailable - using one-shot adb");
     }
 
+#ifdef _WIN32
     if (!emuHwnd_) {
         LOG_WARN("Emulator window not found yet - using ADB capture until it appears");
         setBootStatus("Emulator ready (compat mode)");
@@ -1077,24 +1020,28 @@ void AndroidVirtualMachine::captureLoop() {
         if (!emuHwnd_ && now - lastFind >= std::chrono::milliseconds(1000)) {
             emuHwnd_ = findEmulatorWindow();
             if (emuHwnd_) {
-                GetWindowThreadProcessId(emuHwnd_, &emuPid_);
-                keepEmulatorHidden(emuHwnd_, emuPid_);
-                LOG_INFO("Capturing emulator window hwnd=%p pid=%lu (late discovery)",
-                    (void*)emuHwnd_, emuPid_);
+                HWND hwnd = reinterpret_cast<HWND>(emuHwnd_);
+                DWORD windowPid = 0;
+                GetWindowThreadProcessId(hwnd, &windowPid);
+                emuPid_ = windowPid;
+                keepEmulatorHidden(hwnd, windowPid);
+                LOG_INFO("Capturing emulator window hwnd=%p pid=%llu (late discovery)",
+                    (void*)hwnd, (unsigned long long)emuPid_);
                 setBootStatus("Emulator ready");
             }
             lastFind = now;
         }
         if (emuHwnd_ && now - lastHide >= std::chrono::milliseconds(250)) {
-            keepEmulatorHidden(emuHwnd_, emuPid_);
+            keepEmulatorHidden(reinterpret_cast<HWND>(emuHwnd_), (DWORD)emuPid_);
             lastHide = now;
         }
         auto t0 = std::chrono::steady_clock::now();
         bool captured = false;
+        HWND hwnd = reinterpret_cast<HWND>(emuHwnd_);
 
-        if (memDC && emuHwnd_ && IsWindow(emuHwnd_)) {
+        if (memDC && hwnd && IsWindow(hwnd)) {
             RECT rc{};
-            if (GetClientRect(emuHwnd_, &rc)) {
+            if (GetClientRect(hwnd, &rc)) {
                 int cw = rc.right - rc.left;
                 int ch = rc.bottom - rc.top;
                 if (cw > 0 && ch > 0) {
@@ -1115,7 +1062,7 @@ void AndroidVirtualMachine::captureLoop() {
                         }
                     }
                     // 2 == PW_RENDERFULLCONTENT (not in older MinGW headers)
-                    if (hBmp && PrintWindow(emuHwnd_, memDC, 2)) {
+                    if (hBmp && PrintWindow(hwnd, memDC, 2)) {
                         BITMAPINFO bi{};
                         bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
                         bi.bmiHeader.biWidth = capW;
@@ -1171,6 +1118,30 @@ void AndroidVirtualMachine::captureLoop() {
         DeleteObject(hBmp);
     }
     if (memDC) DeleteDC(memDC);
+#else
+    // POSIX has no capture window and no GDI surface. The hidden adb
+    // exec-out screencap path is the only frame source.
+    const int capFps = std::clamp(spec_.fpsCap, 10, 60);
+    const auto interval = std::chrono::milliseconds(std::max(1, 1000 / capFps));
+    auto lastLog = std::chrono::steady_clock::now();
+    int framesSinceLog = 0;
+    while (running_) {
+        if (state_.load() != VmState::Running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        captureAdbFrame();
+        ++framesSinceLog;
+        const auto now = std::chrono::steady_clock::now();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastLog).count();
+        if (ms >= 5000) {
+            LOG_INFO("Capture %d fps (adb)", (int)(framesSinceLog * 1000 / (ms > 0 ? ms : 1)));
+            framesSinceLog = 0;
+            lastLog = now;
+        }
+        std::this_thread::sleep_for(interval);
+    }
+#endif
 }
 
 void AndroidVirtualMachine::sendTouch(int x, int y, bool down) {
@@ -1214,7 +1185,7 @@ void AndroidVirtualMachine::setAudioMuted(bool muted) {
     if (adbPath_.empty()) findSdk();
     if (adbPath_.empty()) return;
 
-    auto shell = [&](const std::string& body, DWORD timeoutMs = 3000) {
+    auto shell = [&](const std::string& body, int timeoutMs = 3000) {
         return runCmd("\"" + adbPath_ + "\" -s " + serial_ + " shell " + body, timeoutMs);
     };
 

@@ -1,11 +1,23 @@
+#ifndef _WIN32
+// SDL's main redirection is not used: the POSIX entry point below is a plain
+// main(). ui_window.h pulls in the SDL compatibility shim, which includes SDL.h.
+#define SDL_MAIN_HANDLED
+#endif
+
 #include "emulator/app_setup.h"
 #include "emulator/ui_window.h"
 #include "emulator/config.h"
 #include "emulator/logger.h"
-#include <windows.h>
 #include <filesystem>
 #include <string>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include "emulator/platform.h"
+#endif
+
+#ifdef _WIN32
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
     // If BlueDroid is already in the tray, bring it back instead of starting a
     // second manager that would fight over the same phones/ports.
@@ -48,3 +60,42 @@ int main(int argc, char** argv) {
     HINSTANCE hInst = GetModuleHandle(nullptr);
     return wWinMain(hInst, nullptr, GetCommandLineW(), SW_SHOWDEFAULT);
 }
+#else
+int main(int argc, char** argv) {
+    (void)argc; (void)argv;
+
+    // The POSIX guard is file-based. A second manager would use the same
+    // phones/ports, so leave quietly when another instance owns the lock.
+    if (!emu::platform::acquireSingleInstance()) {
+        return 0;
+    }
+
+    // First-run bootstrap must happen before config and logger touch any paths.
+    emu::AppSetup::ensure();
+
+    auto& cfg = emu::ConfigManager::instance();
+    cfg.load(emu::AppSetup::configPath());
+    cfg.config().dataDir = emu::AppSetup::dataDir();
+
+    std::error_code ec;
+    for (const std::string& dir : {
+             emu::AppSetup::dataDir(), emu::AppSetup::imagesDir(),
+             emu::AppSetup::thumbsDir(), emu::AppSetup::backupsDir(),
+             emu::AppSetup::runtimeDir(), emu::AppSetup::tempDir()}) {
+        std::filesystem::create_directories(dir, ec);
+    }
+
+    emu::Logger::instance().setLevel(emu::LogLevel::Info);
+    emu::Logger::instance().setFile(emu::AppSetup::logPath());
+
+    emu::MainWindow win;
+    if (!win.create(nullptr, 1)) {
+        emu::platform::releaseSingleInstance();
+        return 1;
+    }
+    win.runMessageLoop();
+
+    emu::platform::releaseSingleInstance();
+    return 0;
+}
+#endif

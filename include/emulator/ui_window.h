@@ -1,5 +1,9 @@
 #pragma once
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "emulator/sdl_compat.h"
+#endif
 #include <string>
 #include <memory>
 #include <vector>
@@ -9,11 +13,14 @@
 #include <mutex>
 #include <thread>
 #include <cstddef>
+#include <cstdint>
 #include "emulator/vm.h"
 #include "emulator/input_manager.h"
 #include "emulator/phone_profile.h"
 
+#ifdef _WIN32
 struct ID3D11DeviceContext;
+#endif
 
 namespace emu {
 
@@ -65,7 +72,7 @@ private:
     struct ResourceSample {
         double cpuPercent = 0.0;
         size_t ramBytes = 0;
-        ULONGLONG cpuTime = 0;
+        uint64_t cpuTime = 0;
         std::chrono::steady_clock::time_point takenAt{};
     };
 
@@ -123,7 +130,11 @@ private:
 
     void ensurePhoneTexture(int id, int w, int h);
     void updatePhoneTexture(int id, const uint8_t* rgba, int w, int h);
+#ifdef _WIN32
     void releaseTexture(PhoneTexture* tex, ID3D11DeviceContext* ctx);
+#else
+    void releaseTexture(PhoneTexture* tex, void* ctx);
+#endif
 
     void addPhone(const std::string& name, const std::string& templateName = "");
     IVirtualMachine* makeVmForProfile(PhoneProfile* profile, bool attachExisting);

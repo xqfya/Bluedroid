@@ -1,5 +1,7 @@
 #include "emulator/app_setup.h"
+#include "emulator/http_client.h"
 #include "emulator/logger.h"
+#include "emulator/platform.h"
 
 #include <algorithm>
 #include <atomic>
@@ -16,36 +18,22 @@
 #include <utility>
 #include <vector>
 
-#include <winhttp.h>
-
-// MinGW's WinHTTP headers omit a few SDK aliases that MSVC provides.
-#ifndef INTERNET_INVALID_PORT_NUMBER
-#define INTERNET_INVALID_PORT_NUMBER 0
-#endif
-#ifndef WINHTTP_NO_HEADERS
-#define WINHTTP_NO_HEADERS nullptr
-#endif
-
 namespace fs = std::filesystem;
 
 namespace emu {
 namespace {
 
+#ifdef _WIN32
 static const char* const kSystemSdk = "C:\\AndroidSDK";
-
-std::string envA(const char* name) {
-    const char* v = std::getenv(name);
-    return v ? std::string(v) : std::string();
-}
+#else
+static const char* const kSystemSdk = "/opt/android-sdk";
+#endif
+// Keep the historical WinHTTP agent string on Windows; the shared HTTP client
+// also uses it as the libcurl User-Agent on POSIX.
+const char* const kSdkHeaders = "User-Agent: BlueDroid SDK Installer\r\n";
 
 fs::path localRoot() {
-    std::string base = envA("LOCALAPPDATA");
-    if (base.empty()) {
-        const std::string profile = envA("USERPROFILE");
-        base = profile.empty() ? fs::current_path().string()
-                               : (profile + "\\AppData\\Local");
-    }
-    return fs::path(base) / "BlueDroid";
+    return fs::path(emu::platform::dataRoot());
 }
 
 const fs::path& rootPath() {
@@ -54,24 +42,16 @@ const fs::path& rootPath() {
 }
 
 void setEnv(const char* name, const fs::path& value) {
-    // Publish both narrow and wide forms; child processes inherit whichever
-    // variant their CRT uses.
-    const std::string narrow = value.string();
-    SetEnvironmentVariableA(name, narrow.c_str());
-    const std::wstring wideName(name, name + std::strlen(name));
-    SetEnvironmentVariableW(wideName.c_str(), value.wstring().c_str());
-
-    // std::getenv() in this process reads the CRT environment snapshot, which
-    // is not refreshed by SetEnvironmentVariable*. Update it too so the
-    // Android backend sees the same SDK/AVD paths as child processes.
-    const std::string assignment = std::string(name) + "=" + narrow;
-    _putenv(assignment.c_str());
+    // The platform helper updates both the process environment and the CRT
+    // snapshot on Windows, and uses setenv() on POSIX.
+    emu::platform::setEnvironment(name, value.string());
 }
 
 bool hasUsableSdk(const fs::path& sdk) {
     std::error_code ec;
-    return fs::is_regular_file(sdk / "platform-tools" / "adb.exe", ec) &&
-           fs::is_regular_file(sdk / "emulator" / "emulator.exe", ec) &&
+    const std::string suffix = emu::platform::exeSuffix();
+    return fs::is_regular_file(sdk / "platform-tools" / ("adb" + suffix), ec) &&
+           fs::is_regular_file(sdk / "emulator" / ("emulator" + suffix), ec) &&
            fs::exists(sdk / "system-images" / "android-33" /
                       "google_apis_playstore" / "x86_64" / "system.img", ec);
 }
@@ -207,7 +187,29 @@ PackageVersion packageVersion(const std::string& block) {
     return v;
 }
 
-std::string archiveUrl(const std::string& packageBlock, bool windowsOnly) {
+const char* currentHostOs() {
+#ifdef _WIN32
+    return "windows";
+#elif defined(__APPLE__)
+    return "darwin";
+#else
+    return "linux";
+#endif
+}
+
+bool hostMatches(const std::string& archiveHost, const std::string& wantedHost) {
+    if (wantedHost.empty()) return true; // system images are host-neutral
+    const std::string host = lowerCopy(archiveHost);
+    if (wantedHost == "windows") return host.find("windows") != std::string::npos;
+    if (wantedHost == "darwin") {
+        return host.find("darwin") != std::string::npos ||
+               host.find("mac") != std::string::npos;
+    }
+    if (wantedHost == "linux") return host.find("linux") != std::string::npos;
+    return true;
+}
+
+std::string archiveUrl(const std::string& packageBlock, const std::string& wantedHost) {
     size_t pos = 0;
     while ((pos = packageBlock.find("<archive", pos)) != std::string::npos) {
         size_t openEnd = packageBlock.find('>', pos);
@@ -215,12 +217,13 @@ std::string archiveUrl(const std::string& packageBlock, bool windowsOnly) {
         const size_t close = elementEnd(packageBlock, openEnd + 1, "archive");
         if (close == std::string::npos) break;
         const std::string archive = packageBlock.substr(pos, close - pos);
-        const std::string host = lowerCopy(tagValue(archive, "host-os"));
-        if (windowsOnly && host.find("windows") == std::string::npos) {
+        if (!hostMatches(tagValue(archive, "host-os"), wantedHost)) {
             pos = close;
             continue;
         }
         const std::string url = tagValue(archive, "url");
+        // Keep the Windows behaviour byte-for-byte: only ZIP archives are
+        // installed by this bootstrap path.
         if (!url.empty() && lowerCopy(url).find(".zip") != std::string::npos)
             return url;
         pos = close;
@@ -232,7 +235,7 @@ std::string archiveUrl(const std::string& packageBlock, bool windowsOnly) {
 // image manifest contains several revisions of the same package, so comparing
 // revisions is safer than relying on document order.
 std::string latestPackageUrl(const std::string& xml, const std::string& path,
-                             bool windowsOnly) {
+                             const std::string& wantedHost) {
     std::string best;
     PackageVersion bestVersion;
     bool haveBest = false;
@@ -244,7 +247,7 @@ std::string latestPackageUrl(const std::string& xml, const std::string& path,
             lowerCopy(obsolete) == "true") {
             continue;
         }
-        const std::string url = archiveUrl(block, windowsOnly);
+        const std::string url = archiveUrl(block, wantedHost);
         if (url.empty()) continue;
         const PackageVersion version = packageVersion(block);
         if (!haveBest || bestVersion < version) {
@@ -263,149 +266,6 @@ std::string resolvePackageUrl(const std::string& manifestUrl, const std::string&
     const size_t slash = manifestUrl.find_last_of('/');
     if (slash == std::string::npos) return url;
     return manifestUrl.substr(0, slash + 1) + url;
-}
-
-bool splitUrl(const std::string& url, std::wstring& host, INTERNET_PORT& port,
-              std::wstring& path, bool& secure) {
-    const std::wstring wide(url.begin(), url.end());
-    URL_COMPONENTSW parts{};
-    parts.dwStructSize = sizeof(parts);
-    wchar_t hostBuf[256] = {};
-    wchar_t pathBuf[4096] = {};
-    parts.lpszHostName = hostBuf;
-    parts.dwHostNameLength = _countof(hostBuf);
-    parts.lpszUrlPath = pathBuf;
-    parts.dwUrlPathLength = _countof(pathBuf);
-    if (!WinHttpCrackUrl(wide.c_str(), 0, 0, &parts)) return false;
-    host = hostBuf;
-    path = pathBuf[0] ? pathBuf : L"/";
-    port = parts.nPort;
-    secure = parts.nScheme == INTERNET_SCHEME_HTTPS;
-    return !host.empty();
-}
-
-// HTTPS GET implemented with WinHTTP so setup never depends on Java, the
-// command-line tools, or an external downloader. Redirects are followed, and
-// progress is reported with real Content-Length bytes rather than a timer.
-bool httpsGet(const std::string& url, std::string* memory, const fs::path* file,
-              const std::function<void(size_t, size_t)>& progress = {}) {
-    if (!memory && !file) return false;
-
-    std::ofstream out;
-    if (file) {
-        std::error_code ec;
-        fs::create_directories(file->parent_path(), ec);
-        out.open(*file, std::ios::binary | std::ios::trunc);
-        if (!out) return false;
-    }
-
-    std::string current = url;
-    for (int redirect = 0; redirect < 6; ++redirect) {
-        std::wstring host, path;
-        INTERNET_PORT port = INTERNET_INVALID_PORT_NUMBER;
-        bool secure = false;
-        if (!splitUrl(current, host, port, path, secure)) return false;
-
-        HINTERNET session = WinHttpOpen(L"BlueDroid SDK Installer",
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
-            WINHTTP_NO_PROXY_BYPASS, 0);
-        if (!session) return false;
-        WinHttpSetTimeouts(session, 15000, 15000, 60000, 0);
-
-        HINTERNET connect = WinHttpConnect(session, host.c_str(), port, 0);
-        if (!connect) {
-            WinHttpCloseHandle(session);
-            return false;
-        }
-        HINTERNET request = WinHttpOpenRequest(connect, L"GET", path.c_str(),
-            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-            secure ? WINHTTP_FLAG_SECURE : 0);
-        if (!request) {
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
-            return false;
-        }
-        if (!WinHttpSendRequest(request, WINHTTP_NO_HEADERS, 0,
-                WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
-            return false;
-        }
-        if (!WinHttpReceiveResponse(request, nullptr)) {
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
-            return false;
-        }
-
-        DWORD status = 0;
-        DWORD statusSize = sizeof(status);
-        WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE |
-            WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
-            &status, &statusSize, WINHTTP_NO_HEADER_INDEX);
-        if (status >= 300 && status < 400) {
-            wchar_t location[2048] = {};
-            DWORD locationSize = sizeof(location);
-            if (WinHttpQueryHeaders(request, WINHTTP_QUERY_LOCATION,
-                    WINHTTP_HEADER_NAME_BY_INDEX, location, &locationSize,
-                    WINHTTP_NO_HEADER_INDEX)) {
-                std::wstring loc(location);
-                const std::string base = current.substr(0, current.find_last_of('/') + 1);
-                current = std::string(loc.begin(), loc.end());
-                WinHttpCloseHandle(request);
-                WinHttpCloseHandle(connect);
-                WinHttpCloseHandle(session);
-                if (current.compare(0, 4, "http") != 0)
-                    current = base + current;
-                continue;
-            }
-        }
-        if (status != 200) {
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
-            return false;
-        }
-
-        size_t total = 0;
-        DWORD totalDword = 0;
-        DWORD totalSize = sizeof(totalDword);
-        if (WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH |
-                WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
-                &totalDword, &totalSize, WINHTTP_NO_HEADER_INDEX)) {
-            total = totalDword;
-        }
-
-        size_t done = 0;
-        size_t lastReported = 0;
-        char chunk[64 * 1024];
-        bool ok = true;
-        for (;;) {
-            DWORD read = 0;
-            if (!WinHttpReadData(request, chunk, sizeof(chunk), &read)) { ok = false; break; }
-            if (read == 0) break;
-            done += read;
-            if (memory) memory->append(chunk, read);
-            if (out) out.write(chunk, read);
-            if (progress) {
-                const size_t step = total ? (total / 100) + 1 : (2 * 1024 * 1024);
-                if (done - lastReported >= step) {
-                    progress(done, total);
-                    lastReported = done;
-                }
-            }
-        }
-        if (out && (!ok || !out)) ok = false;
-
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
-        if (!ok) return false;
-        if (progress) progress(done, total ? total : done);
-        return true;
-    }
-    return false;
 }
 
 void copyRecursive(const fs::path& src, const fs::path& dst) {
@@ -440,8 +300,13 @@ bool extractZip(const fs::path& zip, const fs::path& staging, const char* label)
     std::error_code ec;
     fs::remove_all(staging, ec);
     fs::create_directories(staging, ec);
+#ifdef _WIN32
     const std::string cmd = "\"C:\\Windows\\System32\\tar.exe\" -xf \"" +
                             zip.string() + "\" -C \"" + staging.string() + "\"";
+#else
+    const std::string cmd = "tar -xf \"" + zip.string() + "\" -C \"" +
+                            staging.string() + "\"";
+#endif
     if (!AppSetup::runHidden(cmd, 0)) {
         LOG_ERROR("%s extraction failed for %s", label, zip.string().c_str());
         return false;
@@ -626,79 +491,11 @@ void AppSetup::setProgressCallback(ProgressCallback cb) {
     g_callback = std::move(cb);
 }
 
-bool AppSetup::runHidden(const std::string& cmd, DWORD timeoutMs,
-                         bool capture, std::string* output) {
-    if (output) output->clear();
-
-    STARTUPINFOA si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-
-    HANDLE hRead = nullptr;
-    HANDLE hWrite = nullptr;
-    if (capture) {
-        SECURITY_ATTRIBUTES sa{};
-        sa.nLength = sizeof(sa);
-        sa.bInheritHandle = TRUE;
-        if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return false;
-        SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
-        si.dwFlags |= STARTF_USESTDHANDLES;
-        si.hStdOutput = hWrite;
-        si.hStdError = hWrite;
-    }
-
-    std::vector<char> buffer(cmd.begin(), cmd.end());
-    buffer.push_back('\0');
-    PROCESS_INFORMATION pi{};
-    const DWORD flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
-    const BOOL started = CreateProcessA(nullptr, buffer.data(), nullptr, nullptr,
-                                        capture ? TRUE : FALSE, flags, nullptr,
-                                        nullptr, &si, &pi);
-    if (!started) {
-        if (hRead) CloseHandle(hRead);
-        if (hWrite) CloseHandle(hWrite);
-        return false;
-    }
-    if (hWrite) {
-        CloseHandle(hWrite); // only the child keeps the write end
-        hWrite = nullptr;
-    }
-
-    if (capture) {
-        char chunk[4096];
-        DWORD read = 0;
-        const bool infinite = (timeoutMs == 0);
-        const auto deadline = std::chrono::steady_clock::now() +
-            std::chrono::milliseconds(infinite ? 0 : timeoutMs);
-        for (;;) {
-            DWORD available = 0;
-            if (!PeekNamedPipe(hRead, nullptr, 0, nullptr, &available, nullptr)) break;
-            if (available == 0) {
-                if (WaitForSingleObject(pi.hProcess, 25) == WAIT_OBJECT_0) {
-                    while (ReadFile(hRead, chunk, sizeof(chunk), &read, nullptr) && read > 0) {
-                        if (output) output->append(chunk, read);
-                    }
-                    break;
-                }
-            } else if (ReadFile(hRead, chunk, sizeof(chunk), &read, nullptr) && read > 0) {
-                if (output) output->append(chunk, read);
-            } else {
-                break;
-            }
-            if (!infinite && std::chrono::steady_clock::now() >= deadline) break;
-        }
-    }
-
-    WaitForSingleObject(pi.hProcess, timeoutMs == 0 ? INFINITE : timeoutMs);
-    DWORD exitCode = 1;
-    if (!GetExitCodeProcess(pi.hProcess, &exitCode) || exitCode == STILL_ACTIVE)
-        exitCode = 1;
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    if (hRead) CloseHandle(hRead);
-    if (hWrite) CloseHandle(hWrite);
-    return exitCode == 0;
+bool AppSetup::runHidden(const std::string& cmd, int timeoutMs,
+                          bool capture, std::string* output) {
+    int exitCode = 1;
+    const bool ok = emu::platform::runCommand(cmd, timeoutMs, capture, output, &exitCode);
+    return ok && exitCode == 0;
 }
 
 bool AppSetup::ensure() {
@@ -746,6 +543,10 @@ bool AppSetup::ensure() {
             setEnv("ANDROID_AVD_HOME", root / "avd");
             setEnv("TMP", root / "temp");
             setEnv("TEMP", root / "temp");
+#ifndef _WIN32
+            // POSIX tools (tar, sh, adb wrappers) use TMPDIR for scratch files.
+            setEnv("TMPDIR", root / "temp");
+#endif
 
             if (g_sdkReady.load()) {
                 g_done.store(true);
@@ -797,9 +598,17 @@ void AppSetup::installSdkAsync() {
         const std::string imagePackage =
             "system-images;android-33;google_apis_playstore;x86_64";
 
+#ifdef _WIN32
         const fs::path platformZip = temp / "platform-tools-win.zip";
         const fs::path emulatorZip = temp / "emulator-win.zip";
+#else
+        const fs::path platformZip = temp / "platform-tools.zip";
+        const fs::path emulatorZip = temp / "emulator.zip";
+#endif
         const fs::path systemImageZip = temp / "android-33-google-apis-playstore-x86_64.zip";
+        const std::string suffix = emu::platform::exeSuffix();
+        const std::string adbMarker = "adb" + suffix;
+        const std::string emulatorMarker = "emulator" + suffix;
 
         auto download = [&](const std::string& label, const std::string& url,
                             const fs::path& dest, int from, int to) -> bool {
@@ -808,8 +617,9 @@ void AppSetup::installSdkAsync() {
             int lastPercent = from - 1;
             publish(label, from);
             LOG_INFO("Downloading %s from %s", label.c_str(), url.c_str());
-            const bool ok = httpsGet(url, nullptr, &dest,
-                [&](size_t done, size_t total) {
+            std::string httpError;
+            const bool ok = emu::platform::httpGet(url, nullptr, &dest,
+                kSdkHeaders, httpError, [&](size_t done, size_t total) {
                     int percent = from;
                     if (total > 0) {
                         const int span = std::max(1, to - from);
@@ -825,7 +635,7 @@ void AppSetup::installSdkAsync() {
                     }
                 });
             if (!ok || !fs::exists(dest, ec) || fs::file_size(dest, ec) == 0) {
-                LOG_ERROR("Download failed: %s", label.c_str());
+                LOG_ERROR("Download failed: %s (%s)", label.c_str(), httpError.c_str());
                 return false;
             }
             LOG_INFO("Downloaded %s (%llu bytes)", label.c_str(),
@@ -864,12 +674,15 @@ void AppSetup::installSdkAsync() {
         publish("Reading Google SDK manifests", 2);
         std::string repositoryXml;
         std::string sysImageXml;
-        if (!httpsGet(repoManifest, &repositoryXml, nullptr)) {
-            failed("Failed to read the Android repository manifest");
+        std::string httpError;
+        if (!emu::platform::httpGet(repoManifest, &repositoryXml, nullptr,
+                                    kSdkHeaders, httpError)) {
+            failed("Failed to read the Android repository manifest: " + httpError);
             return;
         }
-        if (!httpsGet(sysImageManifest, &sysImageXml, nullptr)) {
-            failed("Failed to read the Android system image manifest");
+        if (!emu::platform::httpGet(sysImageManifest, &sysImageXml, nullptr,
+                                    kSdkHeaders, httpError)) {
+            failed("Failed to read the Android system image manifest: " + httpError);
             return;
         }
         LOG_INFO("Repository manifest: %zu bytes; system image manifest: %zu bytes",
@@ -877,13 +690,13 @@ void AppSetup::installSdkAsync() {
 
         const std::string platformPath =
             resolvePackageUrl(repoManifest,
-                latestPackageUrl(repositoryXml, "platform-tools", true));
+                latestPackageUrl(repositoryXml, "platform-tools", currentHostOs()));
         const std::string emulatorPath =
             resolvePackageUrl(repoManifest,
-                latestPackageUrl(repositoryXml, "emulator", true));
+                latestPackageUrl(repositoryXml, "emulator", currentHostOs()));
         const std::string systemImagePath =
             resolvePackageUrl(sysImageManifest,
-                latestPackageUrl(sysImageXml, imagePackage, false));
+                latestPackageUrl(sysImageXml, imagePackage, ""));
         if (platformPath.empty() || emulatorPath.empty() || systemImagePath.empty()) {
             LOG_ERROR("Manifest lookup failed: platform=%s emulator=%s image=%s",
                       platformPath.c_str(), emulatorPath.c_str(),
@@ -899,13 +712,13 @@ void AppSetup::installSdkAsync() {
         if (!download("Downloading platform-tools", platformPath, platformZip, 6, 24))
             { failed("Failed to download platform-tools"); return; }
         if (!install("platform-tools", platformZip, temp / "platform-tools-stage",
-                     "platform-tools", "adb.exe", sdk / "platform-tools", 25))
+                     "platform-tools", adbMarker.c_str(), sdk / "platform-tools", 25))
             return;
 
         if (!download("Downloading Android emulator", emulatorPath, emulatorZip, 29, 58))
             { failed("Failed to download the Android emulator"); return; }
         if (!install("emulator", emulatorZip, temp / "emulator-stage",
-                     "emulator", "emulator.exe", sdk / "emulator", 59))
+                     "emulator", emulatorMarker.c_str(), sdk / "emulator", 59))
             return;
 
         if (!download("Downloading Android 13 system image", systemImagePath,

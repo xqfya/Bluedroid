@@ -7,11 +7,16 @@ with the [User Guide](USER_GUIDE.md).
 
 ```text
 src/
-  main.cpp                    Win32 entry, single instance, bootstrap
-  ui/window.cpp               MainWindow, ImGui scenes, DX11 HD shaders, dialogs,
+  main.cpp                    Win32 wWinMain or POSIX main, single instance,
+                              bootstrap
+  ui/window.cpp               MainWindow, ImGui scenes, renderer, dialogs,
                               APK UI, input
+  ui/sdl_compat.cpp           SDL2/OpenGL shim behind the Win32-shaped UI API
+                              (POSIX only)
   core/
     app_setup.cpp             runtime folders, env vars, manifest-driven SDK install
+    platform.cpp              hidden processes, single-instance lock, data roots
+    http_client.cpp           WinHTTP/libcurl download helper
     config.cpp                global emulator.ini model
     phone_profile.cpp         emulators.ini load/save and identity repair
     vm_factory.cpp            backend selection
@@ -28,22 +33,63 @@ src/
     ppm_writer.c              still screenshot writer
 include/emulator/             public headers
 resources/ui.h                ImGui header/theme helper
-resources/imgui/              Dear ImGui Git submodule + DX11/Win32 backends
+resources/imgui/              Dear ImGui submodule + Win32/DX11 or SDL2/OpenGL3
+                              backends
 data/build.prop               sample only
 ```
 
 ## 2. Build
 
+Prerequisites:
+
+- CMake 3.16+ and a C++17 compiler on every platform.
+- Windows: MSYS2 MinGW-w64 `g++`/`gcc` and `make`.
+- Linux: SDL2 dev, OpenGL dev, and libcurl dev packages, e.g.
+  `sudo apt install build-essential cmake libsdl2-dev libgl1-mesa-dev libcurl4-openssl-dev`.
+- macOS: Xcode Command Line Tools plus `brew install sdl2 curl cmake`.
+
+Dear ImGui is a Git submodule. Clone with it, or update an existing clone:
+
 ```sh
-cd C:\Users\Admin\Downloads\dnSpy-master\dnSpy-master\build
-make -j4
+git clone --recurse-submodules https://github.com/xqfya/Bluedroid.git
+cd Bluedroid
+git submodule update --init --recursive   # only needed for older clones
 ```
 
-Executable:
+Windows (MinGW Makefiles):
+
+```sh
+cmake -S . -B build -G "MinGW Makefiles"
+cmake --build build -j4
+```
+
+Linux/macOS (default generator):
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j4
+```
+
+Executable (same output name everywhere; `.exe` only on Windows):
 
 ```text
-build\bin\BlueDroidEmulator.exe
+build/bin/BlueDroidEmulator      # Linux/macOS
+build\bin\BlueDroidEmulator.exe  # Windows
 ```
+
+### Platform notes
+
+- Windows builds use `wWinMain`, the Win32/DX11 ImGui backends, and DX11 HD
+  shaders. Linux/macOS use a plain `main`, the SDL2/OpenGL3 ImGui backends, and
+  the Win32-shaped SDL compatibility shim.
+- On POSIX there is no `PrintWindow`; live capture uses ADB screencap
+  (`adb exec-out screencap`).
+- Emulator processes stay hidden on all platforms, phones remain isolated by
+  AVD/port/data directory, live FPS and periodic still previews still work,
+  and `Ctrl+0` still resets an unusable UI scale to 100%.
+- Runtime roots: Windows `%LOCALAPPDATA%\BlueDroid`; Linux
+  `$XDG_DATA_HOME/BlueDroid` or `~/.local/share/BlueDroid`; macOS
+  `~/Library/Application Support/BlueDroid`.
 
 If linking fails with permission denied, stop the running process first:
 
@@ -78,10 +124,11 @@ Preserve these when changing code:
 
 `MainWindow` has three modes: `Manager`, `Emulator`, `Settings`.
 
-Rendering is a Win32 message loop plus per-frame `renderFrame()`. The UI uses
-ImGui with a Direct3D 11 backend. `resources/ui.h` provides the themed header
-bar and animation helpers; `src/ui/window.cpp` contains a small `ui::`
-compatibility layer for manager/settings widgets.
+Rendering is a native Win32 or SDL message loop plus per-frame `renderFrame()`.
+The UI uses ImGui with a Direct3D 11 backend on Windows and SDL2 + OpenGL 3 on
+Linux/macOS. `resources/ui.h` provides the themed header bar and animation
+helpers; `src/ui/window.cpp` contains a small `ui::` compatibility layer for
+manager/settings widgets.
 
 Popup styling is centralized in `PopupTheme` so card menus, APK picker, rename,
 delete, and message popups match the active theme.
@@ -107,8 +154,8 @@ artwork without changing the grid slot, preserving hit-testing stability.
 - Launching/attaching/terminating emulator processes with the selected
   `-gpu host` or `-gpu swiftshader` mode.
 - Boot status from ADB.
-- Hidden window capture via `PrintWindow`, ADB fallback, at the configured
-  30/60/120 FPS cap.
+- Hidden window capture via `PrintWindow` on Windows (ADB fallback), or ADB
+  screencap on Linux/macOS, at the configured 30/60/120 FPS cap.
 - Guest media-volume muting for phones parked in the Manager.
 - Persistent hidden input shell.
 - APK upload/install.

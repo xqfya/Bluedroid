@@ -1,7 +1,13 @@
 #include "emulator/input_manager.h"
 #include "emulator/vm.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+// sdlcompat maps SDL keys to the same VK_* values the UI shim forwards, so the
+// mapping below stays shared and no direct SDL header is needed here.
+#include "emulator/sdl_compat.h"
+#endif
 
 namespace emu {
 

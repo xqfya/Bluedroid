@@ -31,7 +31,7 @@ public:
 
     // Step 1: fetch version.json. If (and only if) its "version" is newer than
     // kAppVersion, fetch the latest release, pick a download asset, and save it
-    // under %LOCALAPPDATA%\BlueDroid\runtime\updates.
+    // under the per-user BlueDroid runtime\updates folder.
     //
     // Network/parse failures are returned in UpdateInfo::error instead of
     // throwing. The caller may ignore them for silent startup checks.

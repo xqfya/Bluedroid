@@ -1,232 +1,32 @@
 #include "emulator/updater.h"
 #include "emulator/app_setup.h"
+#include "emulator/http_client.h"
 
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
-
-#include <windows.h>
-#include <winhttp.h>
 
 namespace emu {
 namespace {
 
 namespace fs = std::filesystem;
 
-// GitHub release assets are expected as a ZIP first, then a standalone EXE.
-// The first asset is still used as a fallback so an unusual release layout
-// does not break the updater.
+// Preferred release asset per platform. The first asset is still used as a
+// fallback so an unusual release layout does not break the updater.
+#ifdef _WIN32
 constexpr char kPreferredAssetExtension[] = ".zip";
-constexpr wchar_t kApiHeaders[] =
-    L"User-Agent: BlueDroid-Updater/1.0.0\r\n"
-    L"Accept: application/vnd.github+json\r\n";
-
-std::string winError(const char* what) {
-    return std::string(what) + " (Win32 error " + std::to_string(GetLastError()) + ")";
-}
-
-std::string wideToUtf8(const std::wstring& w) {
-    if (w.empty()) return {};
-    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
-                                      nullptr, 0, nullptr, nullptr);
-    if (n <= 0) return {};
-    std::string out((size_t)n, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
-                        out.data(), n, nullptr, nullptr);
-    return out;
-}
-
-std::wstring utf8ToWide(const std::string& s) {
-    if (s.empty()) return {};
-    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(),
-                                      nullptr, 0);
-    if (n <= 0) return {};
-    std::wstring out((size_t)n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(),
-                        out.data(), n);
-    return out;
-}
-
-bool splitUrl(const std::string& url, std::wstring& host, INTERNET_PORT& port,
-              std::wstring& path, bool& secure) {
-    const std::wstring wide = utf8ToWide(url);
-    URL_COMPONENTSW parts{};
-    parts.dwStructSize = sizeof(parts);
-    wchar_t hostBuf[256] = {};
-    wchar_t pathBuf[8192] = {};
-    parts.lpszHostName = hostBuf;
-    parts.dwHostNameLength = _countof(hostBuf);
-    parts.lpszUrlPath = pathBuf;
-    parts.dwUrlPathLength = _countof(pathBuf);
-    if (!WinHttpCrackUrl(wide.c_str(), 0, 0, &parts)) return false;
-    host = hostBuf;
-    path = pathBuf[0] ? pathBuf : L"/";
-    port = parts.nPort;
-    secure = parts.nScheme == INTERNET_SCHEME_HTTPS;
-    return !host.empty();
-}
-
-std::string resolveRedirect(const std::string& current, const std::string& location) {
-    const std::string low = location;
-    if (low.compare(0, 4, "http") == 0) return location;
-    const size_t slash = current.find_last_of('/');
-    if (slash == std::string::npos) return location;
-    const std::string base = current.substr(0, slash + 1);
-    if (!location.empty() && location[0] == '/') return base + location.substr(1);
-    return base + location;
-}
-
-// HTTPS GET with redirects, timeouts and real byte progress. Writes either to
-// memory (JSON) or to disk (release asset). All failures are reported through
-// `error` so callers never need to catch exceptions.
-bool httpGet(const std::string& url, std::string* memory, const fs::path* file,
-             std::string& error, const wchar_t* headers,
-             const Updater::ProgressCallback& progress) {
-    if (!memory && !file) {
-        error = "no output destination for HTTP GET";
-        return false;
-    }
-
-    std::ofstream out;
-    if (file) {
-        std::error_code ec;
-        fs::create_directories(file->parent_path(), ec);
-        out.open(*file, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            error = "could not open download destination: " + file->string();
-            return false;
-        }
-    }
-
-    std::string current = url;
-    for (int redirect = 0; redirect < 8; ++redirect) {
-        std::wstring host, path;
-        INTERNET_PORT port = 0; // WinHttpCrackUrl fills this (e.g. 443).
-        bool secure = false;
-        if (!splitUrl(current, host, port, path, secure)) {
-            error = "invalid URL: " + current;
-            return false;
-        }
-
-        HINTERNET session = WinHttpOpen(L"BlueDroid Updater",
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
-            WINHTTP_NO_PROXY_BYPASS, 0);
-        if (!session) { error = winError("WinHttpOpen failed"); return false; }
-        WinHttpSetTimeouts(session, 15000, 15000, 60000, 0);
-
-        HINTERNET connect = WinHttpConnect(session, host.c_str(), port, 0);
-        if (!connect) {
-            error = winError("WinHttpConnect failed");
-            WinHttpCloseHandle(session);
-            return false;
-        }
-        HINTERNET request = WinHttpOpenRequest(connect, L"GET", path.c_str(),
-            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-            secure ? WINHTTP_FLAG_SECURE : 0);
-        if (!request) {
-            error = winError("WinHttpOpenRequest failed");
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
-            return false;
-        }
-        if (headers) {
-            WinHttpAddRequestHeaders(request, headers, (DWORD)-1,
-                                     WINHTTP_ADDREQ_FLAG_ADD);
-        }
-        if (!WinHttpSendRequest(request, nullptr, 0,
-                WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
-            error = winError("WinHttpSendRequest failed");
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
-            return false;
-        }
-        if (!WinHttpReceiveResponse(request, nullptr)) {
-            error = winError("WinHttpReceiveResponse failed");
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
-            return false;
-        }
-
-        DWORD status = 0;
-        DWORD statusSize = sizeof(status);
-        WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE |
-            WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
-            &status, &statusSize, WINHTTP_NO_HEADER_INDEX);
-
-        if (status >= 300 && status < 400) {
-            wchar_t location[2048] = {};
-            DWORD locationSize = sizeof(location);
-            if (WinHttpQueryHeaders(request, WINHTTP_QUERY_LOCATION,
-                    WINHTTP_HEADER_NAME_BY_INDEX, location, &locationSize,
-                    WINHTTP_NO_HEADER_INDEX)) {
-                current = resolveRedirect(current, wideToUtf8(location));
-                WinHttpCloseHandle(request);
-                WinHttpCloseHandle(connect);
-                WinHttpCloseHandle(session);
-                continue;
-            }
-        }
-        if (status != 200) {
-            error = "HTTP " + std::to_string(status) + " from " + current;
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
-            return false;
-        }
-
-        size_t total = 0;
-        DWORD totalDword = 0;
-        DWORD totalSize = sizeof(totalDword);
-        if (WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH |
-                WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
-                &totalDword, &totalSize, WINHTTP_NO_HEADER_INDEX)) {
-            total = totalDword;
-        }
-
-        size_t done = 0;
-        size_t lastReported = 0;
-        char chunk[64 * 1024];
-        bool ok = true;
-        for (;;) {
-            DWORD read = 0;
-            if (!WinHttpReadData(request, chunk, sizeof(chunk), &read)) {
-                error = winError("WinHttpReadData failed");
-                ok = false;
-                break;
-            }
-            if (read == 0) break;
-            done += read;
-            if (memory) memory->append(chunk, read);
-            if (out) out.write(chunk, read);
-            if (progress) {
-                const size_t step = total ? (total / 100) + 1 : (2 * 1024 * 1024);
-                if (done - lastReported >= step) {
-                    progress(done, total);
-                    lastReported = done;
-                }
-            }
-        }
-        if (out && (!ok || !out)) {
-            if (error.empty()) error = "failed while writing download";
-            ok = false;
-        }
-
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
-        if (!ok) return false;
-        if (progress) progress(done, total ? total : done);
-        return true;
-    }
-
-    error = "too many HTTP redirects for " + url;
-    return false;
-}
+#elif defined(__APPLE__)
+constexpr char kPreferredAssetExtension[] = ".dmg";
+#else
+constexpr char kPreferredAssetExtension[] = ".AppImage";
+#endif
+constexpr char kApiHeaders[] =
+    "User-Agent: BlueDroid-Updater/1.0.0\r\n"
+    "Accept: application/vnd.github+json\r\n";
 
 bool skipWhitespace(const std::string& s, size_t& i) {
     while (i < s.size() && std::isspace((unsigned char)s[i])) ++i;
@@ -440,11 +240,18 @@ std::string chooseAssetUrl(const std::vector<Asset>& assets, std::string& error)
         return {};
     }
 
+#if defined(_WIN32)
     const char* extensions[] = { kPreferredAssetExtension, ".exe", ".7z" };
+#elif defined(__APPLE__)
+    const char* extensions[] = { kPreferredAssetExtension, ".zip", ".tar.gz" };
+#else
+    const char* extensions[] = { kPreferredAssetExtension, ".tar.gz", ".zip" };
+#endif
     for (const char* ext : extensions) {
+        const std::string wanted = lowerCopy(ext);
         for (const Asset& asset : assets) {
-            if (endsWith(lowerCopy(stripQuery(asset.url)), ext) ||
-                endsWith(lowerCopy(asset.name), ext)) {
+            if (endsWith(lowerCopy(stripQuery(asset.url)), wanted) ||
+                endsWith(lowerCopy(asset.name), wanted)) {
                 return asset.url;
             }
         }
@@ -476,7 +283,7 @@ UpdateInfo Updater::checkAndDownload(const ProgressCallback& progress) {
     // Step 1 - version.json.
     std::string versionJson;
     std::string error;
-    if (!httpGet(kVersionUrl, &versionJson, nullptr, error, nullptr, {})) {
+    if (!emu::platform::httpGet(kVersionUrl, &versionJson, nullptr, "", error)) {
         info.error = "Update check failed: " + error;
         return info;
     }
@@ -494,7 +301,8 @@ UpdateInfo Updater::checkAndDownload(const ProgressCallback& progress) {
 
     // Step 3 - latest release JSON and its first/matching asset.
     std::string releaseJson;
-    if (!httpGet(kLatestReleaseUrl, &releaseJson, nullptr, error, kApiHeaders, {})) {
+    if (!emu::platform::httpGet(kLatestReleaseUrl, &releaseJson, nullptr,
+                                kApiHeaders, error)) {
         info.error = "Release lookup failed: " + error;
         return info;
     }
@@ -510,7 +318,8 @@ UpdateInfo Updater::checkAndDownload(const ProgressCallback& progress) {
     // Step 4 - save the asset under the per-user runtime folder.
     const fs::path dir = fs::path(AppSetup::runtimeDir()) / "updates";
     const fs::path destination = dir / fileNameFromUrl(info.downloadUrl);
-    if (!httpGet(info.downloadUrl, nullptr, &destination, error, nullptr, progress)) {
+    if (!emu::platform::httpGet(info.downloadUrl, nullptr, &destination, "",
+                                error, progress)) {
         info.error = "Download failed: " + error;
         return info;
     }
