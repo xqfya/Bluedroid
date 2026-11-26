@@ -1,7 +1,8 @@
 # Build output and local runtime state
 /build/
 /target/
-/data/
+/data/*
+!/data/build.prop
 /thumbs/
 /emulator.ini
 /emulators.ini
