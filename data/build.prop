@@ -1,0 +1,17 @@
+ro.product.brand=google
+ro.product.manufacturer=Google
+ro.product.model=Pixel 7
+ro.product.device=panther
+ro.product.name=panther
+ro.build.fingerprint=google/panther/panther:13/TQ3A.230901.001/10756687:user/release-keys
+ro.build.id=TQ3A.230901.001
+ro.build.version.release=13
+ro.build.version.sdk=33
+ro.build.version.security_patch=2023-09-01
+ro.build.type=user
+ro.build.tags=release-keys
+ro.debuggable=0
+ro.secure=1
+ro.boot.verifiedbootstate=green
+ro.boot.flash.locked=1
+ro.boot.vbmeta.device_state=locked
