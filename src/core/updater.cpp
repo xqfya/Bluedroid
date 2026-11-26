@@ -25,7 +25,7 @@ constexpr char kPreferredAssetExtension[] = ".dmg";
 constexpr char kPreferredAssetExtension[] = ".AppImage";
 #endif
 constexpr char kApiHeaders[] =
-    "User-Agent: BlueDroid-Updater/1.0.0\r\n"
+    "User-Agent: BlueDroid-Updater/1.0.1\r\n"
     "Accept: application/vnd.github+json\r\n";
 
 bool skipWhitespace(const std::string& s, size_t& i) {
