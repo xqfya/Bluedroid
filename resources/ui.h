@@ -1,29 +1,3 @@
-// ui.h  -  Dear ImGui header bar and single custom theme
-//
-//  * Single header, public ImGui API only (works with 1.89 - 1.92)
-//  * No icon font needed: every icon is drawn with ImDrawList
-//  * Pill navigation bar with an animated, expanding active tab
-//  * Brand / status chips / donate on the left, utility icons + window controls on the right
-//  * Theme struct (colours + corner scale) so you can recolour it like your settings page
-//
-//  Usage:
-//      static hdr::Header header;
-//      hdr::ApplyStyle(header.theme);                // once, after ImGui::CreateContext()
-//
-//      // every frame, before your content windows:
-//      hdr::Events ev = header.Draw();
-//      if (ev.navClicked >= 0) page = ev.navClicked;
-//      if (ev.close)           running = false;
-//      // ev.minimize / ev.maximize / ev.dragStart / ev.dragDoubleClick -> hook to your window API
-//
-//      // content window sits below it:
-//      ImGuiViewport* vp = ImGui::GetMainViewport();
-//      ImGui::SetNextWindowPos (ImVec2(vp->Pos.x, vp->Pos.y + header.height));
-//      ImGui::SetNextWindowSize(ImVec2(vp->Size.x, vp->Size.y - header.height));
-//
-//  Note: hover/tab animations need frames to advance. If you only render on input events,
-//  keep rendering for ~300 ms after a click or mouse move.
-
 #pragma once
 #include "imgui.h"
 #include <algorithm>
